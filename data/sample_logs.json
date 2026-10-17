@@ -1,0 +1,36 @@
+{
+  "logs": [
+    {
+      "timestamp": "2026-10-17T10:00:01Z",
+      "service": "Database Service",
+      "severity": "error",
+      "message": "Connection pool exhausted",
+      "trace_id": "trace-payment-001",
+      "exception_type": "PoolExhaustedError"
+    },
+    {
+      "timestamp": "2026-10-17T10:00:02Z",
+      "service": "Payment Service",
+      "severity": "ERROR",
+      "message": "Database request timed out",
+      "request_id": "req-payment-001",
+      "trace_id": "trace-payment-001",
+      "exception_type": "TimeoutError"
+    },
+    {
+      "timestamp": "2026-10-17T10:00:03Z",
+      "service": "Payment Service",
+      "severity": "ERROR",
+      "message": "Payment processing failed",
+      "request_id": "req-payment-001",
+      "trace_id": "trace-payment-001"
+    },
+    {
+      "timestamp": "2026-10-17T10:00:04Z",
+      "service": "User Service",
+      "severity": "warn",
+      "message": "Request latency exceeded threshold",
+      "request_id": "req-user-002"
+    }
+  ]
+}
