@@ -80,3 +80,65 @@ class LogPage(BaseModel):
     total: int
     limit: int
     offset: int
+
+
+class IncidentStatus(str, Enum):
+    OPEN = "open"
+    INVESTIGATING = "investigating"
+    RESOLVED = "resolved"
+
+
+class IncidentUpdate(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    status: IncidentStatus
+
+
+class IncidentRead(BaseModel):
+    id: int
+    title: str
+    severity: Severity
+    status: IncidentStatus
+    first_seen: datetime
+    last_seen: datetime
+    occurrence_count: int
+    created_at: datetime
+    updated_at: datetime
+    detection_rules: list[str]
+    affected_services: list[str]
+    related_log_ids: list[int]
+
+
+class IncidentEvidence(BaseModel):
+    log: LogRead
+    reason: str
+    strength: str
+    related_log_id: int | None
+
+
+class IncidentRelationship(BaseModel):
+    upstream_incident_id: int
+    downstream_incident_id: int
+    upstream_log_id: int
+    downstream_log_id: int
+    reason: str
+    strength: str
+
+
+class IncidentDetail(IncidentRead):
+    evidence: list[IncidentEvidence]
+    relationships: list[IncidentRelationship]
+    causality: str = "unconfirmed"
+
+
+class IncidentPage(BaseModel):
+    items: list[IncidentRead]
+    total: int
+    limit: int
+    offset: int
+
+
+class DetectionResult(BaseModel):
+    incidents_created: int
+    logs_assigned: int
+    links_created: int

@@ -3,11 +3,13 @@ from datetime import datetime
 from typing import Annotated
 
 from fastapi import Depends, FastAPI, HTTPException, Query
+from fastapi.responses import JSONResponse
 from sqlalchemy import func, select, text
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session
 
 from app.database import Base, engine, get_session
+from app.incidents import router as incidents_router
 from app.models import LogRecord
 from app.schemas import (
     LogBatch,
@@ -22,14 +24,20 @@ from app.schemas import (
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # Phase 1 bootstrap. Use migrations before evolving a deployed schema.
+    # Phase 2 is additive: new tables only, with no changes to existing log columns.
     Base.metadata.create_all(engine)
     yield
     engine.dispose()
 
 
-app = FastAPI(title="TraceMind", version="0.1.0", lifespan=lifespan)
+app = FastAPI(title="TraceMind", version="0.2.0", lifespan=lifespan)
+app.include_router(incidents_router)
 DB = Annotated[Session, Depends(get_session)]
+
+
+@app.exception_handler(SQLAlchemyError)
+async def database_error_handler(request, exc):
+    return JSONResponse(status_code=503, content={"detail": "Database operation unavailable"})
 
 
 @app.get("/health")
