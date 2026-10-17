@@ -11,6 +11,7 @@ from sqlalchemy.orm import Session
 from app.database import Base, engine, get_session
 from app.incidents import router as incidents_router
 from app.models import LogRecord
+from app.rca_routes import router as rca_router
 from app.schemas import (
     LogBatch,
     LogPage,
@@ -24,14 +25,15 @@ from app.schemas import (
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # Phase 2 is additive: new tables only, with no changes to existing log columns.
+    # Phases 2–3 are additive: new tables only, with no changes to existing log columns.
     Base.metadata.create_all(engine)
     yield
     engine.dispose()
 
 
-app = FastAPI(title="TraceMind", version="0.2.0", lifespan=lifespan)
+app = FastAPI(title="TraceMind", version="0.3.0", lifespan=lifespan)
 app.include_router(incidents_router)
+app.include_router(rca_router)
 DB = Annotated[Session, Depends(get_session)]
 
 

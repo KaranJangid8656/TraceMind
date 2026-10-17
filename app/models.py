@@ -72,3 +72,22 @@ class IncidentLink(Base):
     downstream_incident_id: Mapped[int] = mapped_column(ForeignKey("incidents.id"), index=True)
     reason: Mapped[str] = mapped_column(String(100))
     strength: Mapped[str] = mapped_column(String(20), default="weak")
+
+
+class RCAReport(Base):
+    __tablename__ = "rca_reports"
+    __table_args__ = (Index("ix_rca_reports_incident_created", "incident_id", "created_at", "id"),)
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    incident_id: Mapped[int] = mapped_column(ForeignKey("incidents.id"))
+    provider: Mapped[str] = mapped_column(String(50))
+    model: Mapped[str | None] = mapped_column(String(200), nullable=True)
+    prompt_version: Mapped[str] = mapped_column(String(50))
+    evidence_hash: Mapped[str] = mapped_column(String(64))
+    evidence_snapshot: Mapped[dict] = mapped_column(JSON)
+    analysis: Mapped[dict] = mapped_column(JSON)
+    validation_notes: Mapped[list[str]] = mapped_column(JSON)
+    duration_ms: Mapped[int]
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=lambda: datetime.now(UTC)
+    )

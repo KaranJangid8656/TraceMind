@@ -1,6 +1,6 @@
 # TraceMind
 
-Phases 1–2 of an incident investigation platform: validated log ingestion, deterministic incident detection, and evidence-backed correlation with FastAPI, Pydantic, SQLAlchemy, and PostgreSQL. Embeddings and AI diagnosis are not implemented yet. Correlations are investigation leads, not confirmed causes.
+Phases 1–3 of an incident investigation platform: validated log ingestion, deterministic incident detection, evidence-backed correlation, and optional AI-assisted RCA with FastAPI, Pydantic, SQLAlchemy, and PostgreSQL. Historical semantic retrieval and verified-resolution feedback are not implemented yet. Correlations and AI reports are investigation leads, not confirmed causes.
 
 ## Run with Docker
 
@@ -138,3 +138,144 @@ Expected: original incident IDs and status remain; detection reports zero new as
 ### Current limits
 
 This initial detector scans stored logs and incident memberships in memory, and the detail endpoint returns the full evidence timeline. It is intended for a small development dataset. Before production workloads, add bounded background processing, evidence pagination, calibrated spike baselines, migrations, and authentication. PostgreSQL advisory transaction locking serializes detector runs so concurrent workers cannot double-assign logs. Identifier equality is strong correlation evidence, not proof of a common cause.
+
+## Phase 3: AI-assisted root cause analysis
+
+Phase 3 builds an evidence package from a stored incident, requests a structured RCA hypothesis, validates the output, and persists an immutable report with its exact evidence snapshot. It adds the `rca_reports` table without altering the Phase 1 or Phase 2 tables. Ingestion and incident detection do not automatically invoke an LLM.
+
+### Configure the provider
+
+RCA is disabled by default. Supported values of `RCA_PROVIDER` are `disabled`, `openai`, and `gemini`. Existing APIs work without an API key. If `.env` does not exist, copy `.env.example`; preserve any existing configuration:
+
+```powershell
+if (-not (Test-Path .env)) { Copy-Item .env.example .env }
+```
+
+Open the file locally and update existing entries rather than adding duplicate keys:
+
+```powershell
+notepad .env
+```
+
+For Gemini:
+
+```dotenv
+RCA_PROVIDER=gemini
+GEMINI_API_KEY=your-gemini-api-key
+GEMINI_MODEL=gemini-3.5-flash-lite
+RCA_TIMEOUT_SECONDS=30
+RCA_MAX_LOGS=40
+RCA_MAX_EVIDENCE_CHARS=40000
+RCA_MAX_OUTPUT_TOKENS=4000
+```
+
+Replace the API-key placeholder locally. `gemini-3.5-flash-lite` is listed for free-tier text input/output in [Google's pricing documentation](https://ai.google.dev/gemini-api/docs/pricing) and supports [structured outputs](https://ai.google.dev/gemini-api/docs/generate-content/structured-output), checked October 18, 2026. Free-tier eligibility and limits depend on the Google project: check its tier and active limits in [Google AI Studio](https://aistudio.google.com/usage). Keep the project on the Free tier if you want free-tier usage. TraceMind cannot force a paid project to be billed as free. Google explains [project usage tiers and rate limits](https://ai.google.dev/gemini-api/docs/rate-limits); do not assume a fixed free request allowance.
+
+No paid API or Google SDK dependency is required. The Gemini adapter reuses the existing `httpx` dependency, does not enable tools/search, and never automatically retries, switches providers, or falls back to another model when quota is exhausted. A Google HTTP 429 becomes a sanitized HTTP 503; wait for your project's quota to recover rather than repeatedly analyzing the incident. Model availability and free-tier terms can change.
+
+For OpenAI, the existing configuration still works:
+
+```dotenv
+RCA_PROVIDER=openai
+OPENAI_API_KEY=your-api-key
+OPENAI_MODEL=your-structured-output-capable-model
+RCA_TIMEOUT_SECONDS=30
+RCA_MAX_LOGS=40
+RCA_MAX_EVIDENCE_CHARS=40000
+RCA_MAX_OUTPUT_TOKENS=4000
+```
+
+Replace both OpenAI placeholders with your own key and an available model that supports strict structured output through the Responses API. Only the selected provider's credentials are required. Keys are kept in the ignored `.env` file; do not commit or paste them into chat. The OpenAI adapter follows the [official OpenAI Structured Outputs guide](https://developers.openai.com/api/docs/guides/structured-outputs?api-mode=responses). To disable new analyses, set `RCA_PROVIDER=disabled`; saved reports remain readable.
+
+Rebuild the API:
+
+```powershell
+docker compose up --build -d api
+```
+
+Explicit analysis requests send the selected evidence (including log messages and identifiers) to the configured provider. Review what your logs contain before enabling it. OpenAI requests set `store: false`; that OpenAI-specific option is not sent to Gemini. This is not a claim about either provider's retention policies. Google's pricing page marks free-tier usage as eligible for product improvement. No tools, automatic remediation, automatic retries, or live provider calls are enabled in tests.
+
+The Gemini adapter uses the official `https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent` HTTP endpoint. The API key is sent only in the `x-goog-api-key` header, never in the URL. Model configuration accepts a Gemini model ID or the same ID with a `models/` prefix, which is normalized before use; URLs and arbitrary paths are rejected.
+
+Gemini receives native `systemInstruction`, `contents`, and `generationConfig` fields. The generation configuration uses `responseMimeType: "application/json"` and `responseJsonSchema` containing the schema derived from `RCAOutput`. These fields are documented in [Google's v1beta API definition](https://github.com/googleapis/googleapis/blob/master/google/ai/generativelanguage/v1beta/generative_service.proto) and [REST discovery document](https://generativelanguage.googleapis.com/$discovery/rest?version=v1beta). The adapter sends neither `responseFormat` nor `responseSchema`, avoiding the differing MIME representations shown for `responseFormat` in Google's guide and reference. Local schema references are inlined, nullable text becomes a type array, and string-length constraints unsupported by Google's documented subset are omitted from the generation schema only. The unchanged Pydantic/RCA pipeline still enforces every original constraint, evidence citation, affected service, ranking, confidence limit, and contradiction check before saving a report.
+
+Only a single candidate with `finishReason: STOP` is accepted. Blocked, incomplete, empty, malformed, or unexpected non-text results are rejected. Text parts are joined without including thought parts. The decoded response envelope is limited to 1,000,000 bytes during reading; report text is limited to 100,000 characters. Gemini uses the existing timeout and output-token settings; evidence limits remain provider independent. Public errors never include provider response bodies or API keys.
+
+Gemini HTTP failures produce a warning in the API logs with `http_status`, an allowlisted `provider_status`, and a fixed diagnostic description. The classifier reads at most 16 KiB of the error body and never copies arbitrary provider messages, field names, details, headers, credentials, or incident evidence into logs. Unrecognized errors get a generic description. A failed diagnostic read preserves the original HTTP error mapping, including quota errors. View these warnings with `docker compose logs --tail 50 api`; public API errors remain sanitized.
+
+Google can return HTTP 400 / `INVALID_ARGUMENT` with no field-level explanation. This is logged as `Invalid argument; provider supplied no field details`; it does not establish which field Google rejected. Mocked request-contract tests verify the adapter's wire format and validation, but a successful manual analysis is still needed to verify live provider compatibility.
+
+### Generate and retrieve a report
+
+Use an existing detected incident; you do not need to resubmit the sample logs:
+
+```powershell
+$incidentId = 1
+$report = Invoke-RestMethod -Method Post `
+  -Uri "http://localhost:8000/incidents/$incidentId/analyze" `
+  -ContentType 'application/json' -Body '{"max_logs":40}'
+$report.analysis | ConvertTo-Json -Depth 10
+
+Invoke-RestMethod "http://localhost:8000/incidents/$incidentId/analyses?limit=20&offset=0"
+Invoke-RestMethod "http://localhost:8000/incidents/$incidentId/analyses/$($report.id)"
+```
+
+The request body is optional. If supplied, only `max_logs` (1–100) is accepted; the server's `RCA_MAX_LOGS` remains an upper bound. Every successful POST creates a separate report and makes a new provider call when usable evidence exists. There is no result caching or idempotency key in this phase. GET requests never call the provider and remain available when RCA is disabled.
+
+| Method | Endpoint | Behavior |
+|---|---|---|
+| POST | `/incidents/{id}/analyze` | Generate, validate and save a report; HTTP 201 |
+| GET | `/incidents/{id}/analyses` | Paginated history, newest first |
+| GET | `/incidents/{id}/analyses/{report_id}` | One saved report and its evidence snapshot |
+
+### Report contents and validation
+
+The `analysis` object contains:
+
+- `status`: `hypothesis` or `inconclusive`; never `confirmed`.
+- `summary`, nullable `probable_cause`, and `supporting_log_ids`.
+- `observed_facts`, each with supporting log IDs.
+- `ranked_causes`, with contiguous ranks, explanations, confidence, supporting IDs, and contradicting IDs.
+- `affected_services`, qualitative `confidence`, `alternative_explanations`, `recommended_checks`, and `evidence_gaps`.
+
+The response also includes provider/model metadata, prompt version, creation time, duration, validation notes, SHA-256 evidence hash, the evidence snapshot, and `causality: "unconfirmed"`.
+
+All citations must be integer IDs from the actual evidence package. A real log elsewhere in the database is not an allowed citation. Invented services, unknown fields, invalid statuses, duplicate citations, contradictory citation roles, and inconsistent cause rankings are rejected. The selected probable cause and its citations must match the first ranked hypothesis. Facts and hypotheses remain separately represented.
+
+Confidence is capped at medium for log-only evidence and reduced to low for sparse or truncated input. If the leading candidate includes contradicting log IDs, the backend changes the result to inconclusive and removes the selected probable cause. This guard depends on the model reporting contradictions; it does not automatically understand every contradiction in natural language.
+
+Structural and reference validation does not prove that cited logs support a claim. The provider must reason about relevance, and a developer must review the result. Test fixtures exercise the pipeline, not real-model diagnosis accuracy.
+
+### Evidence selection and audit history
+
+Evidence includes incident metadata, detection rules, original correlated logs, membership reasons/strengths, and weak relationships whose two log endpoints fit the package. ERROR/CRITICAL records are selected first, ordered by timestamp and ID, followed by lower-severity context. Linked-incident logs use remaining capacity. The final timeline is chronological.
+
+Input is bounded by log count and the character length of the compact evidence JSON. Individual messages are capped at 2,000 characters and may be shortened further to fit. Omitted logs/relationships and truncated messages are recorded as evidence gaps. The original logs are never changed. `affected_services` reflects the incident services represented in the selected evidence, so truncated reports may not cover every service in the full incident.
+
+Saved reports remain historical snapshots when new logs arrive, incident status changes, or another analysis runs. A report does not automatically refresh; generate another report for current evidence. Reports do not change incident status, verify a cause, or save a resolution. If no usable logs fit, a local evidence guard can save an explicitly inconclusive report without making a provider call.
+
+### Failure behavior
+
+| HTTP status | Meaning |
+|---|---|
+| 404 | Incident/report not found when the request reaches the resource lookup |
+| 422 | Invalid request body or pagination |
+| 502 | Provider error, refusal, incomplete output, invalid schema, or invalid evidence references |
+| 503 | RCA disabled/unconfigured, provider rate limit/quota, or database unavailable |
+| 504 | Provider timeout |
+
+Failed provider calls and invalid reports do not create report rows. Provider error details and API keys are not returned to callers. The provider's HTTP timeout applies to network operations. Analysis is synchronous; use background jobs and request controls before scaling to many simultaneous analyses.
+
+### Validate Phase 3
+
+Run the complete suite with SQLite or PostgreSQL using the commands in the Validate section. To focus on RCA:
+
+```powershell
+.\.venv\Scripts\python.exe -m pytest tests/test_rca.py tests/test_llm.py -q
+```
+
+Tests inject scripted provider responses and mocked HTTP transports. They cover the sample failure chain, insufficient evidence, declared contradictions, invented and out-of-scope citations, rankings, affected services, evidence limits, report history, timeouts, refusals, malformed output, and sanitized provider errors. OpenAI tests are retained; Gemini tests cover its native request/schema, provider selection, successful and incomplete responses, authentication and quota failures, network errors, redirects, response limits, and end-to-end RCA validation/persistence. PostgreSQL tests additionally verify saved reports survive disposal of the connection pool. All provider calls are mocked; no tests make billable provider requests.
+
+After a manual Gemini analysis, check `$report.provider` is `gemini`, `$report.model` is your configured model ID, every citation belongs to `$report.evidence_snapshot.logs`, and the report can be retrieved through the same history endpoints. A missing/blank Gemini key or model returns 503 without making a provider request. Authentication/configuration errors from Google return 502 with a generic message; quota errors return 503 and timeouts return 504. Failed or invalid responses do not create report rows.
+
+After configuring a live provider, generate a report, inspect every cited log against `evidence_snapshot.logs`, check the difference between observations and hypotheses, and review alternatives and investigation steps. Restart the API and retrieve that same report ID to verify persistence. A successful model call alone is not a diagnosis-quality evaluation; a separate evaluation dataset and human review are still needed.
