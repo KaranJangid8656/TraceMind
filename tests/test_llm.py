@@ -74,16 +74,30 @@ def test_responses_request_contract_and_prompt_isolation():
     assert provider(handler).analyze(evidence) == '{"test":"ok"}'
 
 
-@pytest.mark.parametrize("status,expected", [(401, 502), (429, 503), (500, 502), (302, 502)])
-def test_http_failures_are_sanitized(status, expected):
+@pytest.mark.parametrize(
+    "status,expected,category",
+    [
+        (401, 502, "http_error"),
+        (429, 503, "rate_limit"),
+        (500, 502, "http_error"),
+        (302, 502, "http_error"),
+    ],
+)
+def test_http_failures_are_sanitized(caplog, status, expected, category):
+    caplog.set_level("WARNING", logger="app.llm")
+
     def handler(request):
         return httpx.Response(status, text="secret provider details test-secret")
 
     with pytest.raises(ProviderFailure) as error:
         provider(handler).analyze({})
     assert error.value.status_code == expected
+    assert error.value.category == category
     assert "test-secret" not in error.value.detail
     assert "secret provider details" not in error.value.detail
+    assert f"OpenAI request failed: category={category} http_status={status}" in caplog.text
+    assert "test-secret" not in caplog.text
+    assert "secret provider details" not in caplog.text
 
 
 @pytest.mark.parametrize(

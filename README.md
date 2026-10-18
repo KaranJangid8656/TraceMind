@@ -366,11 +366,13 @@ Phase 3 builds a bounded evidence package from an existing incident and asks the
 3. Record evidence omissions and truncation as explicit evidence gaps.
 4. Send the evidence and system instructions to the selected provider.
 5. Decode and validate the response with `RCAOutput`.
-6. Verify every cited log ID belongs to the supplied evidence snapshot.
-7. Reject invented services, duplicate citations, overlapping supporting/contradicting citations, invalid ranks, unsupported statuses, and unknown fields.
-8. Require `probable_cause` and top-level citations to match the first ranked hypothesis.
-9. Cap confidence at medium for log-only evidence and reduce it for sparse or contradictory evidence.
-10. Persist the analysis, evidence snapshot, hash, provider metadata, prompt version, and duration in one report.
+6. Verify every cited log ID belongs to the supplied evidence snapshot and reject duplicate citation IDs.
+7. Reject invented services, overlapping supporting/contradicting citations, invalid ranks, unsupported statuses, and unknown fields.
+8. For a hypothesis, require at least one observed fact, reject duplicate cause text case-insensitively, and require confidence to be non-increasing by rank.
+9. Require `probable_cause` to equal the first ranked cause and require its top-level citation list to match the first cause's citations exactly, including order.
+10. Convert a report with contradictory evidence on its first-ranked cause to inconclusive, clear the selected cause and top-level citations, and lower confidence.
+11. Merge snapshot omission and truncation gaps into the final report, remove duplicates while preserving order, and keep at most 20 gaps.
+12. Persist the analysis, evidence snapshot, hash, provider, model, prompt version, validation notes, and total duration in one report transaction.
 
 Reports can have `hypothesis` or `inconclusive` status. They cannot claim `confirmed`. Every API response retains `causality: "unconfirmed"`.
 
@@ -431,8 +433,12 @@ New reports use prompt version `rca-v2`, which explicitly requires the probable 
 - Provider credentials are never put in URLs, response bodies, or application diagnostics.
 - Public failures do not expose provider bodies, authorization headers, incident evidence, or API keys.
 - Gemini diagnostics log only HTTP status, an allowlisted provider status, and a bounded classified description.
+- OpenAI diagnostics use fixed failure categories and omit response bodies and exception details.
+- RCA orchestration records provider-call elapsed time with a monotonic clock for successful and failed calls. Validation and persistence failures use stable categories.
+- Diagnostic records include bounded provider, model, prompt-version, status, and timing fields where applicable. They exclude full prompts, raw evidence, raw provider output, authorization headers, API keys, and unsanitized response bodies.
 - Provider response envelopes and extracted report text have hard size limits.
-- Failed calls and rejected output do not create report rows.
+- Report metadata is created only after provider output passes validation. A report is returned and logged as persisted only after the database commit succeeds; persistence errors roll back and retain the controlled API error.
+- Failed calls, rejected output, and failed commits do not leave report rows.
 - A cited log proves only that the log was supplied and referenced; human review is still required to judge whether it supports the claim.
 
 Provider requests send selected incident evidence to the configured external service. Review log contents and the provider's data terms before enabling RCA.
@@ -489,15 +495,37 @@ Remove-Item Env:\TEST_DATABASE_URL
 
 The database user must be allowed to create and drop schemas.
 
-### Focused Phase 3 suite
+### Focused RCA and provider suite
 
 ```powershell
 .\.venv\Scripts\python.exe -m pytest tests/test_llm.py tests/test_rca.py -q
 ```
 
+### Deterministic RCA benchmark
+
+Run the fixture-backed RCA contract benchmark without provider credentials or network access:
+
+```powershell
+.\.venv\Scripts\python.exe -m pytest -m rca_benchmark -q
+```
+
+The benchmark reuses the main RCA regression tests for a valid hypothesis, the local no-evidence
+result, invalid citations, missing observed facts, duplicate causes, increasing confidence by rank,
+contradictory primary evidence, provider timeout, omission disclosure, and rejection without
+persistence. It checks deterministic contract behavior rather than subjective causal accuracy.
+
+Run the same static checks used for RCA changes:
+
+```powershell
+.\.venv\Scripts\python.exe -m ruff check app/rca.py app/rca_schemas.py app/llm.py tests/test_rca.py tests/test_llm.py
+.\.venv\Scripts\python.exe -m ruff format --check app/rca.py app/rca_schemas.py app/llm.py tests/test_rca.py tests/test_llm.py
+git diff --check
+```
+
 Coverage includes validation and normalization, filtering, atomic batches, deterministic correlation, identifier conflicts, fixed windows, weak relationships, idempotency, lifecycle changes, pagination, transaction rollback, evidence bounds, immutable report history, Gemini and OpenAI wire contracts, malformed output, citation integrity, exact cause matching, quota and authentication failures, timeouts, response limits, secret sanitization, and PostgreSQL persistence.
 
-The latest verified full PostgreSQL run completed with **183 passing tests**. Ruff lint and formatting checks passed. A live Gemini RCA report was generated, validated, persisted, and retrieved; live provider calls remain a manual verification step.
+The fixture-backed benchmark makes no live Gemini or OpenAI requests. It verifies deterministic
+contract and persistence behavior; it does not measure causal accuracy, throughput, or latency.
 
 ## Persistence verification
 
@@ -514,6 +542,7 @@ Incident IDs, statuses, logs, and saved RCA reports should remain available. Run
 
 - Detection scans stored logs and memberships in memory and is intended for a development-scale dataset.
 - RCA requests are synchronous.
+- Provider calls run inline with the request; there is no queue, background execution, or cancellation API.
 - Incident detail returns the complete evidence timeline rather than a paginated timeline.
 - Burst detection uses a fixed threshold, not a learned baseline.
 - Identifier equality and temporal order are correlation evidence, not causal proof.
@@ -521,6 +550,8 @@ Incident IDs, statuses, logs, and saved RCA reports should remain available. Run
 - Table creation uses SQLAlchemy metadata; production schema migrations are not configured.
 - There is no semantic search over previous incidents or verified resolution knowledge base.
 - There is no dashboard or background worker.
+- The deterministic RCA benchmark uses mocked providers and fixed fixtures. It does not evaluate live-provider behavior, causal accuracy, throughput, or latency.
+- The PostgreSQL persistence test is skipped when `TEST_DATABASE_URL` is unavailable; the remaining tests use isolated in-memory SQLite databases.
 - TraceMind does not confirm causes or execute remediation.
 
 PostgreSQL advisory transaction locking serializes detector runs so concurrent workers cannot assign the same stored log twice.
@@ -557,4 +588,13 @@ pyproject.toml
 
 ## Phase 4
 
-Phase 4 is intentionally deferred. The current boundary is a stable Phase 3 backend with persisted, evidence-backed RCA reports. Potential future work includes historical incident retrieval, reviewed causes and resolutions, measurable diagnosis evaluation, asynchronous processing, and a dashboard, but those requirements will be finalized before implementation.
+Phase 4's deterministic RCA validation and reliability audit is complete. The implemented boundary
+includes ordered citation consistency, observed-fact requirements for hypotheses, duplicate-cause
+rejection, non-increasing confidence by rank, contradictory-evidence handling, normalized evidence
+gaps, persistence rollback coverage, immutable report metadata, sanitized structured diagnostics,
+provider no-retry tests, and the fixture-backed `rca_benchmark` suite.
+
+This phase establishes repeatable contract validation and failure handling. It does not establish
+that a provider's proposed cause is correct, compare model quality, benchmark request throughput or
+latency, exercise live provider services, add reviewed causes or resolutions, or make RCA processing
+asynchronous. Those remain separate product and evaluation concerns.

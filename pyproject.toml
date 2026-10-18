@@ -24,6 +24,9 @@ include = ["app*"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+markers = [
+    "rca_benchmark: deterministic fixture-backed RCA contract benchmark",
+]
 
 [tool.ruff]
 line-length = 100

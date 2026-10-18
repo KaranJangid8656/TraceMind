@@ -2,11 +2,14 @@
 
 import hashlib
 import json
+import logging
+import re
 from copy import deepcopy
 from time import perf_counter
 
 from pydantic import ValidationError
 from sqlalchemy import case, func, or_, select
+from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session
 
 from app.config import Settings
@@ -15,6 +18,18 @@ from app.llm import PROMPT_VERSION, ProviderFailure, RCAProvider
 from app.models import Incident, IncidentLink, IncidentLog, LogRecord, RCAReport
 from app.rca_schemas import RCAOutput, RCAReportRead, RCARequest
 from app.schemas import LogRead
+
+logger = logging.getLogger(__name__)
+
+
+def _log_identifier(value: str | None) -> str:
+    if value and re.fullmatch(r"[A-Za-z0-9._-]{1,200}", value):
+        return value
+    return "none"
+
+
+def _reject_analysis(category: str, detail: str) -> None:
+    raise ProviderFailure(502, detail, category)
 
 
 def evidence_json(evidence: dict) -> str:
@@ -155,33 +170,60 @@ def validate_analysis(raw: str, evidence: dict) -> tuple[RCAOutput, list[str]]:
     try:
         result = RCAOutput.model_validate_json(raw)
     except (ValidationError, ValueError, TypeError):
-        raise ProviderFailure(502, "RCA provider returned an invalid report schema") from None
+        raise ProviderFailure(
+            502, "RCA provider returned an invalid report schema", "schema_invalid"
+        ) from None
     ids = {entry["id"] for entry in evidence["logs"]}
     lists = [result.supporting_log_ids]
     lists.extend(fact.supporting_log_ids for fact in result.observed_facts)
     for cause in result.ranked_causes:
         lists.extend([cause.supporting_log_ids, cause.contradicting_log_ids])
         if set(cause.supporting_log_ids) & set(cause.contradicting_log_ids):
-            raise ProviderFailure(502, "RCA report contains contradictory citation roles")
+            _reject_analysis(
+                "citation_role_conflict", "RCA report contains contradictory citation roles"
+            )
     if any(not set(cited) <= ids or len(cited) != len(set(cited)) for cited in lists):
-        raise ProviderFailure(
-            502, "RCA report cited logs outside its evidence or duplicated citations"
+        _reject_analysis(
+            "citation_invalid", "RCA report cited logs outside its evidence or duplicated citations"
         )
     if not set(result.affected_services) <= set(evidence["incident"]["affected_services"]):
-        raise ProviderFailure(502, "RCA report invented affected services")
+        _reject_analysis("affected_services_invalid", "RCA report invented affected services")
     if [cause.rank for cause in result.ranked_causes] != list(
         range(1, len(result.ranked_causes) + 1)
     ):
-        raise ProviderFailure(502, "RCA report returned invalid cause rankings")
+        _reject_analysis("ranking_invalid", "RCA report returned invalid cause rankings")
+    confidence_levels = {"low": 0, "medium": 1, "high": 2}
+    if any(
+        confidence_levels[current.confidence] < confidence_levels[following.confidence]
+        for current, following in zip(result.ranked_causes, result.ranked_causes[1:])
+    ):
+        _reject_analysis(
+            "confidence_ranking_invalid", "RCA report returned invalid cause confidence rankings"
+        )
     if result.status == "hypothesis":
-        if not result.ranked_causes or result.probable_cause != result.ranked_causes[0].cause:
-            raise ProviderFailure(
-                502, "RCA report probable cause does not match its first hypothesis"
+        if not result.observed_facts:
+            _reject_analysis(
+                "observed_facts_missing",
+                "Hypothesis RCA report must contain at least one observed fact",
             )
-        if set(result.supporting_log_ids) != set(result.ranked_causes[0].supporting_log_ids):
-            raise ProviderFailure(502, "RCA report probable cause has inconsistent citations")
+        causes = [cause.cause.casefold() for cause in result.ranked_causes]
+        if len(causes) != len(set(causes)):
+            _reject_analysis("duplicate_causes", "RCA report contains duplicate ranked causes")
+        if not result.ranked_causes or result.probable_cause != result.ranked_causes[0].cause:
+            _reject_analysis(
+                "probable_cause_mismatch",
+                "RCA report probable cause does not match its first hypothesis",
+            )
+        if result.supporting_log_ids != result.ranked_causes[0].supporting_log_ids:
+            _reject_analysis(
+                "primary_citations_mismatch",
+                "RCA report probable cause has inconsistent citations",
+            )
     elif result.probable_cause is not None or result.supporting_log_ids:
-        raise ProviderFailure(502, "Inconclusive RCA report must not assert a probable cause")
+        _reject_analysis(
+            "inconclusive_cause_invalid",
+            "Inconclusive RCA report must not assert a probable cause",
+        )
 
     notes = []
     # Confidence is a qualitative assessment, never a calibrated probability or confirmation.
@@ -252,9 +294,38 @@ def create_report(
         provider_name, model = "evidence_guard", None
     else:
         # An adapter must not be able to mutate the evidence that validates its own output.
-        raw = provider.analyze(deepcopy(evidence))
         provider_name, model = provider.name, provider.model
-    result, notes = validate_analysis(raw, evidence)
+        provider_started = perf_counter()
+        try:
+            raw = provider.analyze(deepcopy(evidence))
+        except ProviderFailure as exc:
+            logger.warning(
+                "event=rca_provider_failed provider=%s model=%s category=%s "
+                "status_code=%d duration_ms=%d",
+                _log_identifier(provider_name),
+                _log_identifier(model),
+                _log_identifier(exc.category),
+                exc.status_code,
+                round((perf_counter() - provider_started) * 1000),
+            )
+            raise
+        logger.info(
+            "event=rca_provider_completed provider=%s model=%s duration_ms=%d",
+            _log_identifier(provider_name),
+            _log_identifier(model),
+            round((perf_counter() - provider_started) * 1000),
+        )
+    try:
+        result, notes = validate_analysis(raw, evidence)
+    except ProviderFailure as exc:
+        logger.warning(
+            "event=rca_validation_failed provider=%s model=%s category=%s status_code=%d",
+            _log_identifier(provider_name),
+            _log_identifier(model),
+            _log_identifier(exc.category),
+            exc.status_code,
+        )
+        raise
     report = RCAReport(
         incident_id=incident_id,
         provider=provider_name,
@@ -266,10 +337,28 @@ def create_report(
         validation_notes=notes,
         duration_ms=round((perf_counter() - started) * 1000),
     )
-    session.add(report)
-    session.flush()
-    saved = report_data(report)
-    session.commit()
+    try:
+        session.add(report)
+        session.flush()
+        saved = report_data(report)
+        session.commit()
+    except SQLAlchemyError:
+        session.rollback()
+        logger.warning(
+            "event=rca_persistence_failed category=database_error provider=%s model=%s "
+            "prompt_version=%s",
+            _log_identifier(provider_name),
+            _log_identifier(model),
+            _log_identifier(PROMPT_VERSION),
+        )
+        raise
+    logger.info(
+        "event=rca_report_persisted provider=%s model=%s prompt_version=%s duration_ms=%d",
+        _log_identifier(provider_name),
+        _log_identifier(model),
+        _log_identifier(PROMPT_VERSION),
+        report.duration_ms,
+    )
     return saved
 
 

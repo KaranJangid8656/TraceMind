@@ -34,9 +34,10 @@ remediation. If evidence is truncated, acknowledge the gap. Output only the requ
 
 
 class ProviderFailure(Exception):
-    def __init__(self, status_code: int, detail: str):
+    def __init__(self, status_code: int, detail: str, category: str = "provider_failure"):
         self.status_code = status_code
         self.detail = detail
+        self.category = category
         super().__init__(detail)
 
 
@@ -92,10 +93,17 @@ class OpenAIProvider:
                     json=body,
                 )
             if response.status_code == 429:
-                raise ProviderFailure(503, "RCA provider rate limit or quota exceeded")
-            if response.is_error or response.is_redirect:
+                logger.warning("OpenAI request failed: category=rate_limit http_status=%d", 429)
                 raise ProviderFailure(
-                    502, "RCA provider request failed; check server configuration"
+                    503, "RCA provider rate limit or quota exceeded", "rate_limit"
+                )
+            if response.is_error or response.is_redirect:
+                logger.warning(
+                    "OpenAI request failed: category=http_error http_status=%d",
+                    response.status_code,
+                )
+                raise ProviderFailure(
+                    502, "RCA provider request failed; check server configuration", "http_error"
                 )
             payload = response.json()
             if payload.get("status") != "completed":
@@ -115,11 +123,16 @@ class OpenAIProvider:
                 raise ProviderFailure(502, "RCA provider report exceeded the size limit")
             return output_text[0]
         except httpx.TimeoutException:
-            raise ProviderFailure(504, "RCA provider timed out") from None
+            logger.warning("OpenAI request failed: category=timeout")
+            raise ProviderFailure(504, "RCA provider timed out", "timeout") from None
         except httpx.HTTPError:
-            raise ProviderFailure(502, "Unable to reach RCA provider") from None
+            logger.warning("OpenAI request failed: category=network_error")
+            raise ProviderFailure(502, "Unable to reach RCA provider", "network_error") from None
         except (ValueError, TypeError, KeyError, AttributeError):
-            raise ProviderFailure(502, "RCA provider returned malformed data") from None
+            logger.warning("OpenAI request failed: category=malformed_response")
+            raise ProviderFailure(
+                502, "RCA provider returned malformed data", "malformed_response"
+            ) from None
 
 
 def gemini_response_schema() -> dict[str, Any]:

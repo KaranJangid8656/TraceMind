@@ -1,16 +1,28 @@
 import hashlib
 import json
 import os
+from contextlib import contextmanager
 from copy import deepcopy
+from datetime import UTC, datetime
 from pathlib import Path
 
 import httpx
 import pytest
+from sqlalchemy import func, select
+from sqlalchemy.exc import SQLAlchemyError
 
+from app import rca
 from app.config import Settings
 from app.database import get_session
-from app.llm import PROMPT_VERSION, GeminiProvider, ProviderFailure, get_rca_provider
+from app.llm import (
+    PROMPT_VERSION,
+    GeminiProvider,
+    OpenAIProvider,
+    ProviderFailure,
+    get_rca_provider,
+)
 from app.main import app
+from app.models import Incident, LogRecord, RCAReport
 from app.rca import evidence_json
 
 SAMPLE = json.loads((Path(__file__).parents[1] / "data" / "sample_logs.json").read_text())
@@ -73,6 +85,7 @@ def seed(client, records=None):
     return client.get("/incidents").json()["items"][0]["id"]
 
 
+@pytest.mark.rca_benchmark
 def test_rca_report_and_evidence_round_trip(client, fake_provider):
     incident_id = seed(client)
     response = client.post(f"/incidents/{incident_id}/analyze")
@@ -119,6 +132,181 @@ def test_history_pagination_and_snapshot_immutability(client, fake_provider):
     assert third["evidence_hash"] != first["evidence_hash"]
 
 
+def test_report_commit_failure_rolls_back_insert(client, fake_provider, monkeypatch, caplog):
+    incident_id = seed(client)
+    caplog.set_level("WARNING", logger="app.rca")
+    original_session = app.dependency_overrides[get_session]
+    inserted_counts = []
+
+    def failing_session():
+        with contextmanager(original_session)() as session:
+
+            def fail_commit():
+                inserted_counts.append(session.scalar(select(func.count()).select_from(RCAReport)))
+                raise SQLAlchemyError("PRIVATE persistence failure")
+
+            with monkeypatch.context() as patch:
+                patch.setattr(session, "commit", fail_commit)
+                yield session
+
+    app.dependency_overrides[get_session] = failing_session
+    try:
+        response = client.post(f"/incidents/{incident_id}/analyze")
+    finally:
+        app.dependency_overrides[get_session] = original_session
+    assert inserted_counts == [1]  # The insert actually reached the transaction before failure.
+    assert response.status_code == 503
+    assert response.json() == {"detail": "Database operation unavailable"}
+    assert client.get(f"/incidents/{incident_id}/analyses").json()["total"] == 0
+    assert "event=rca_persistence_failed category=database_error" in caplog.text
+    assert "PRIVATE persistence failure" not in caplog.text
+    assert "event=rca_report_persisted" not in caplog.text
+    with contextmanager(original_session)() as session:
+        assert session.scalar(select(func.count()).select_from(RCAReport)) == 0
+    assert client.post(f"/incidents/{incident_id}/analyze").status_code == 201
+
+
+def test_successful_provider_call_logs_latency_and_report_metadata(client, fake_provider, caplog):
+    incident_id = seed(client)
+    caplog.set_level("INFO", logger="app.rca")
+
+    response = client.post(f"/incidents/{incident_id}/analyze")
+
+    assert response.status_code == 201, response.text
+    assert (
+        "event=rca_provider_completed provider=test-double model=scripted-fixture duration_ms="
+        in caplog.text
+    )
+    assert (
+        "event=rca_report_persisted provider=test-double model=scripted-fixture "
+        f"prompt_version={PROMPT_VERSION}" in caplog.text
+    )
+
+
+def test_failed_provider_call_logs_latency_without_sensitive_details(client, fake_provider, caplog):
+    incident_id = seed(client)
+    caplog.set_level("WARNING", logger="app.rca")
+
+    def fail(_evidence):
+        raise ProviderFailure(504, "PRIVATE provider failure")
+
+    fake_provider.respond = fail
+    response = client.post(f"/incidents/{incident_id}/analyze")
+
+    assert response.status_code == 504
+    assert (
+        "event=rca_provider_failed provider=test-double model=scripted-fixture "
+        "category=provider_failure status_code=504 duration_ms=" in caplog.text
+    )
+    assert "PRIVATE provider failure" not in caplog.text
+    assert client.get(f"/incidents/{incident_id}/analyses").json()["total"] == 0
+
+
+def test_validation_failure_logs_category_without_provider_output(client, fake_provider, caplog):
+    incident_id = seed(client)
+    caplog.set_level("WARNING", logger="app.rca")
+
+    def invalid(evidence):
+        result = hypothesis(evidence)
+        result["observed_facts"][0]["observation"] = "PRIVATE raw provider output"
+        result["supporting_log_ids"] = [999999]
+        return result
+
+    fake_provider.respond = invalid
+    response = client.post(f"/incidents/{incident_id}/analyze")
+
+    assert response.status_code == 502
+    assert (
+        "event=rca_validation_failed provider=test-double model=scripted-fixture "
+        "category=citation_invalid status_code=502" in caplog.text
+    )
+    assert "PRIVATE raw provider output" not in caplog.text
+    assert "999999" not in caplog.text
+    assert client.get(f"/incidents/{incident_id}/analyses").json()["total"] == 0
+
+
+@pytest.mark.rca_benchmark
+def test_no_usable_evidence_skips_provider(client, fake_provider):
+    with contextmanager(app.dependency_overrides[get_session])() as session:
+        now = datetime.now(UTC)
+        incident = Incident(
+            title="Incident without logs", severity="ERROR", first_seen=now, last_seen=now
+        )
+        session.add(incident)
+        session.flush()
+        incident_id = incident.id
+        session.commit()
+
+    response = client.post(f"/incidents/{incident_id}/analyze")
+    assert response.status_code == 201, response.text
+    assert len(fake_provider.calls) == 0
+    report = response.json()
+    assert report["provider"] == "evidence_guard"
+    assert report["model"] is None
+    assert report["evidence_snapshot"]["logs"] == []
+    assert report["analysis"]["status"] == "inconclusive"
+    assert report["analysis"]["probable_cause"] is None
+    assert report["analysis"]["supporting_log_ids"] == []
+    assert report["analysis"]["confidence"] == "low"
+    assert "No usable log evidence is available." in report["analysis"]["evidence_gaps"]
+    assert client.get(f"/incidents/{incident_id}/analyses/{report['id']}").json() == report
+    assert len(fake_provider.calls) == 0
+
+
+def test_stored_report_survives_log_edits_and_prompt_change(client, fake_provider, monkeypatch):
+    incident_id = seed(client)
+    response = client.post(f"/incidents/{incident_id}/analyze")
+    assert response.status_code == 201
+    first = response.json()
+    log_id = first["evidence_snapshot"]["logs"][0]["id"]
+    with contextmanager(app.dependency_overrides[get_session])() as session:
+        session.get(LogRecord, log_id).message = "Updated source log after report creation"
+        session.commit()
+    monkeypatch.setattr(rca, "PROMPT_VERSION", "test-future-prompt")
+    response = client.post(f"/incidents/{incident_id}/analyze")
+    assert response.status_code == 201
+    second = response.json()
+    assert second["prompt_version"] == "test-future-prompt"
+    assert second["evidence_hash"] != first["evidence_hash"]
+    assert (
+        next(log for log in second["evidence_snapshot"]["logs"] if log["id"] == log_id)["message"]
+        == "Updated source log after report creation"
+    )
+    assert client.get(f"/incidents/{incident_id}/analyses/{first['id']}").json() == first
+    with contextmanager(app.dependency_overrides[get_session])() as session:
+        stored = session.get(RCAReport, first["id"])
+        assert stored.prompt_version == first["prompt_version"] == PROMPT_VERSION
+        assert stored.evidence_snapshot == first["evidence_snapshot"]
+
+
+@pytest.mark.parametrize("failure,expected", [(429, 503), (500, 502), ("timeout", 504)])
+def test_openai_failure_does_not_retry_or_fall_back(client, monkeypatch, failure, expected):
+    incident_id = seed(client)
+    calls = []
+
+    def handler(request):
+        calls.append(str(request.url))
+        if failure == "timeout":
+            raise httpx.ReadTimeout("private timeout details", request=request)
+        return httpx.Response(failure, text="private provider details")
+
+    def forbid_fallback(self, evidence):
+        pytest.fail("OpenAI failure must not invoke Gemini")
+
+    monkeypatch.setattr(GeminiProvider, "analyze", forbid_fallback)
+    provider = OpenAIProvider(
+        Settings(_env_file=None, openai_api_key="test-secret", openai_model="test-model"),
+        transport=httpx.MockTransport(handler),
+    )
+    app.dependency_overrides[get_rca_provider] = lambda: provider
+    response = client.post(f"/incidents/{incident_id}/analyze")
+    assert response.status_code == expected
+    assert calls == ["https://api.openai.com/v1/responses"]
+    assert "private" not in response.text
+    assert client.get(f"/incidents/{incident_id}/analyses").json()["total"] == 0
+
+
+@pytest.mark.rca_benchmark
 @pytest.mark.parametrize("location", ["supporting", "fact", "ranked", "contradicting"])
 def test_invented_log_ids_rejected_without_persistence(client, fake_provider, location):
     incident_id = seed(client)
@@ -216,6 +404,82 @@ def test_probable_cause_requires_exact_verbatim_first_ranked_cause(client, fake_
     assert client.get(f"/incidents/{incident_id}/analyses").json()["total"] == 0
 
 
+def test_probable_cause_requires_exact_citation_order(client, fake_provider):
+    incident_id = seed(client)
+
+    def respond(evidence):
+        result = hypothesis(evidence)
+        assert len(result["supporting_log_ids"]) >= 2
+        result["supporting_log_ids"] = list(reversed(result["supporting_log_ids"]))
+        return result
+
+    fake_provider.respond = respond
+    response = client.post(f"/incidents/{incident_id}/analyze")
+    assert response.status_code == 502
+    assert response.json()["detail"] == ("RCA report probable cause has inconsistent citations")
+    assert client.get(f"/incidents/{incident_id}/analyses").json()["total"] == 0
+
+
+@pytest.mark.rca_benchmark
+def test_hypothesis_requires_observed_fact(client, fake_provider):
+    incident_id = seed(client)
+
+    def respond(evidence):
+        result = hypothesis(evidence)
+        result["observed_facts"] = []
+        return result
+
+    fake_provider.respond = respond
+    response = client.post(f"/incidents/{incident_id}/analyze")
+    assert response.status_code == 502
+    assert response.json()["detail"] == (
+        "Hypothesis RCA report must contain at least one observed fact"
+    )
+    assert client.get(f"/incidents/{incident_id}/analyses").json()["total"] == 0
+
+
+@pytest.mark.rca_benchmark
+def test_hypothesis_rejects_duplicate_ranked_causes(client, fake_provider):
+    incident_id = seed(client)
+
+    def respond(evidence):
+        result = hypothesis(evidence)
+        duplicate = deepcopy(result["ranked_causes"][0])
+        duplicate.update(rank=2, cause=duplicate["cause"].swapcase(), confidence="low")
+        result["ranked_causes"].append(duplicate)
+        return result
+
+    fake_provider.respond = respond
+    response = client.post(f"/incidents/{incident_id}/analyze")
+    assert response.status_code == 502
+    assert response.json()["detail"] == "RCA report contains duplicate ranked causes"
+    assert client.get(f"/incidents/{incident_id}/analyses").json()["total"] == 0
+
+
+@pytest.mark.rca_benchmark
+def test_hypothesis_rejects_confidence_increase_at_lower_rank(client, fake_provider):
+    incident_id = seed(client)
+
+    def respond(evidence):
+        result = hypothesis(evidence)
+        result["confidence"] = "low"
+        result["ranked_causes"][0]["confidence"] = "low"
+        lower_ranked = deepcopy(result["ranked_causes"][0])
+        lower_ranked.update(
+            rank=2,
+            cause="Excess application concurrency may have exhausted available workers.",
+            confidence="medium",
+        )
+        result["ranked_causes"].append(lower_ranked)
+        return result
+
+    fake_provider.respond = respond
+    response = client.post(f"/incidents/{incident_id}/analyze")
+    assert response.status_code == 502
+    assert response.json()["detail"] == "RCA report returned invalid cause confidence rankings"
+    assert client.get(f"/incidents/{incident_id}/analyses").json()["total"] == 0
+
+
 def test_sparse_inconclusive_evidence(client, fake_provider):
     incident_id = seed(client, [SAMPLE["logs"][0]])
 
@@ -239,6 +503,7 @@ def test_sparse_inconclusive_evidence(client, fake_provider):
     assert report["analysis"]["evidence_gaps"]
 
 
+@pytest.mark.rca_benchmark
 def test_conflicting_evidence_forces_inconclusive(client, fake_provider):
     records = [
         SAMPLE["logs"][0],
@@ -278,6 +543,7 @@ def test_log_only_high_confidence_is_capped(client, fake_provider):
     assert report["validation_notes"]
 
 
+@pytest.mark.rca_benchmark
 def test_bounded_evidence_and_omission_disclosure(client, fake_provider, monkeypatch):
     monkeypatch.setenv("RCA_MAX_EVIDENCE_CHARS", "2000")
     records = deepcopy(SAMPLE["logs"])
@@ -305,7 +571,7 @@ def test_weak_link_includes_external_evidence(client, fake_provider):
     assert evidence["relationships"][0]["strength"] == "weak"
 
 
-@pytest.mark.parametrize("status", [502, 503, 504])
+@pytest.mark.parametrize("status", [502, 503, pytest.param(504, marks=pytest.mark.rca_benchmark)])
 def test_provider_failures_leave_no_report(client, fake_provider, status):
     incident_id = seed(client)
 
