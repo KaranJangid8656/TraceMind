@@ -205,6 +205,10 @@ Gemini HTTP failures produce a warning in the API logs with `http_status`, an al
 
 Google can return HTTP 400 / `INVALID_ARGUMENT` with no field-level explanation. This is logged as `Invalid argument; provider supplied no field details`; it does not establish which field Google rejected. Mocked request-contract tests verify the adapter's wire format and validation, but a successful manual analysis is still needed to verify live provider compatibility.
 
+Controlled live tests isolated an RCA-schema rejection to the combination of nested citation-array `maxItems: 100` bounds. Plain text, JSON mode, and a minimal object schema passed. A reduced `ranked_causes` schema containing both bounded citation arrays failed; removing one bound made that reduced case pass. The complete RCA schema passed after omitting only the bounds on `observed_facts.items.supporting_log_ids`, `ranked_causes.items.supporting_log_ids`, and `ranked_causes.items.contradicting_log_ids`. Restoring `candidateCount`, the configured `maxOutputTokens`, and `systemInstruction` individually also passed. These probes used synthetic text, not incident evidence.
+
+The translator omits just those three generation-time bounds. Pydantic still enforces the 100-ID maximum on every citation array before persistence, covered by API regression tests. Root array limits, minimum citation counts, numeric rank bounds, nullable fields, enums, required fields, and `additionalProperties: false` are retained. This is a compatibility adjustment for the observed schema combination, not a claim that Gemini rejects every use of `maxItems`. Google documents both the supported keyword and [schema-complexity limitations](https://ai.google.dev/gemini-api/docs/generate-content/structured-output).
+
 ### Generate and retrieve a report
 
 Use an existing detected incident; you do not need to resubmit the sample logs:
@@ -238,7 +242,7 @@ The `analysis` object contains:
 - `ranked_causes`, with contiguous ranks, explanations, confidence, supporting IDs, and contradicting IDs.
 - `affected_services`, qualitative `confidence`, `alternative_explanations`, `recommended_checks`, and `evidence_gaps`.
 
-The response also includes provider/model metadata, prompt version, creation time, duration, validation notes, SHA-256 evidence hash, the evidence snapshot, and `causality: "unconfirmed"`.
+The response also includes provider/model metadata, prompt version, creation time, duration, validation notes, SHA-256 evidence hash, the evidence snapshot, and `causality: "unconfirmed"`. New reports use prompt version `rca-v2`, which requires `probable_cause` to exactly match the first ranked cause; existing reports retain the version stored when they were generated.
 
 All citations must be integer IDs from the actual evidence package. A real log elsewhere in the database is not an allowed citation. Invented services, unknown fields, invalid statuses, duplicate citations, contradictory citation roles, and inconsistent cause rankings are rejected. The selected probable cause and its citations must match the first ranked hypothesis. Facts and hypotheses remain separately represented.
 

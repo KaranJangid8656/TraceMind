@@ -9,7 +9,7 @@ import pytest
 
 from app.config import Settings
 from app.database import get_session
-from app.llm import GeminiProvider, ProviderFailure, get_rca_provider
+from app.llm import PROMPT_VERSION, GeminiProvider, ProviderFailure, get_rca_provider
 from app.main import app
 from app.rca import evidence_json
 
@@ -79,6 +79,7 @@ def test_rca_report_and_evidence_round_trip(client, fake_provider):
     assert response.status_code == 201, response.text
     report = response.json()
     assert report["provider"] == "test-double"
+    assert report["prompt_version"] == PROMPT_VERSION
     assert report["causality"] == "unconfirmed"
     assert report["analysis"]["status"] == "hypothesis"
     assert "connection-pool exhaustion" in report["analysis"]["probable_cause"]
@@ -167,7 +168,6 @@ def test_malformed_reports(client, fake_provider, raw):
         "service",
         "confirmed",
         "rank",
-        "mismatch",
         "extra",
         "string_id",
         "duplicate_id",
@@ -185,8 +185,6 @@ def test_invalid_report_semantics(client, fake_provider, problem):
             result["status"] = "confirmed"
         elif problem == "rank":
             result["ranked_causes"][0]["rank"] = 2
-        elif problem == "mismatch":
-            result["probable_cause"] = "Different cause"
         elif problem == "extra":
             result["execute_remediation"] = True
         elif problem == "string_id":
@@ -199,6 +197,23 @@ def test_invalid_report_semantics(client, fake_provider, problem):
 
     fake_provider.respond = respond
     assert client.post(f"/incidents/{incident_id}/analyze").status_code == 502
+
+
+def test_probable_cause_requires_exact_verbatim_first_ranked_cause(client, fake_provider):
+    incident_id = seed(client)
+
+    def respond(evidence):
+        result = hypothesis(evidence)
+        result["probable_cause"] = "Payment timeouts may have followed database pool exhaustion."
+        return result
+
+    fake_provider.respond = respond
+    response = client.post(f"/incidents/{incident_id}/analyze")
+    assert response.status_code == 502
+    assert response.json()["detail"] == (
+        "RCA report probable cause does not match its first hypothesis"
+    )
+    assert client.get(f"/incidents/{incident_id}/analyses").json()["total"] == 0
 
 
 def test_sparse_inconclusive_evidence(client, fake_provider):
@@ -350,6 +365,9 @@ def test_report_survives_connection_pool_disposal(client, fake_provider):
         "timeout",
         "quota",
         "invalid_argument",
+        "fact_citation_limit",
+        "cause_citation_limit",
+        "contradicting_citation_limit",
     ],
 )
 def test_gemini_runs_through_existing_rca_validation_and_persistence(client, caplog, scenario):
@@ -394,6 +412,18 @@ def test_gemini_runs_through_existing_rca_validation_and_persistence(client, cap
             result["ranked_causes"][0]["rank"] = 2
         elif scenario == "string_length":
             result["summary"] = "x" * 4001
+        elif scenario == "fact_citation_limit":
+            result["observed_facts"][0]["supporting_log_ids"] = [
+                result["supporting_log_ids"][0]
+            ] * 101
+        elif scenario == "cause_citation_limit":
+            result["ranked_causes"][0]["supporting_log_ids"] = [
+                result["supporting_log_ids"][0]
+            ] * 101
+        elif scenario == "contradicting_citation_limit":
+            result["ranked_causes"][0]["contradicting_log_ids"] = [
+                result["supporting_log_ids"][0]
+            ] * 101
         elif scenario == "contradiction":
             ids = result["supporting_log_ids"]
             result["supporting_log_ids"] = ids[:2]
@@ -432,6 +462,8 @@ def test_gemini_runs_through_existing_rca_validation_and_persistence(client, cap
         assert response.status_code == expected
         assert "mock-gemini-secret" not in response.text
         assert "mock-gemini-secret" not in caplog.text
+        if scenario.endswith("citation_limit"):
+            assert response.json()["detail"] == "RCA provider returned an invalid report schema"
         if scenario == "invalid_argument":
             assert "http_status=400 provider_status=INVALID_ARGUMENT" in caplog.text
             assert "Invalid argument; provider supplied no field details" in caplog.text

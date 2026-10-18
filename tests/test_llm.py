@@ -1,4 +1,5 @@
 import json
+from copy import deepcopy
 
 import httpx
 import pytest
@@ -9,6 +10,7 @@ from app.config import Settings
 from app.llm import (
     GEMINI_ERROR_BODY_LIMIT,
     INSTRUCTIONS,
+    PROMPT_VERSION,
     GeminiProvider,
     OpenAIProvider,
     ProviderFailure,
@@ -16,6 +18,12 @@ from app.llm import (
     get_rca_provider,
 )
 from app.rca_schemas import RCAOutput
+
+
+def test_rca_v2_prompt_requires_exact_hypothesis_match():
+    assert PROMPT_VERSION == "rca-v2"
+    assert "probable_cause must be an exact verbatim copy of ranked_causes[0].cause" in INSTRUCTIONS
+    assert "not a paraphrase" in INSTRUCTIONS
 
 
 def provider(handler):
@@ -199,6 +207,56 @@ def test_gemini_schema_translation_preserves_shape_and_nullable_cause():
         assert unsupported not in serialized
     # Translation must not mutate the canonical validator's constraints.
     assert RCAOutput.model_json_schema()["properties"]["summary"]["maxLength"] == 4000
+
+
+def test_gemini_nested_citation_bounds_regression(monkeypatch):
+    corrected = gemini_response_schema()
+    rejected = deepcopy(corrected)
+    for collection, fields in (
+        ("observed_facts", ("supporting_log_ids",)),
+        ("ranked_causes", ("supporting_log_ids", "contradicting_log_ids")),
+    ):
+        for field in fields:
+            node = corrected["properties"][collection]["items"]["properties"][field]
+            assert "maxItems" not in node
+            assert node["items"]["type"] == "integer"
+            if field == "supporting_log_ids":
+                assert node["minItems"] == 1
+            rejected["properties"][collection]["items"]["properties"][field]["maxItems"] = 100
+    assert corrected["properties"]["supporting_log_ids"]["maxItems"] == 100
+    assert corrected["properties"]["affected_services"]["maxItems"] == 100
+    assert corrected["properties"]["observed_facts"]["maxItems"] == 30
+    assert corrected["properties"]["ranked_causes"]["maxItems"] == 5
+    canonical = RCAOutput.model_json_schema()
+    assert (
+        canonical["$defs"]["EvidenceClaim"]["properties"]["supporting_log_ids"]["maxItems"] == 100
+    )
+    for field in ("supporting_log_ids", "contradicting_log_ids"):
+        assert canonical["$defs"]["RankedCause"]["properties"][field]["maxItems"] == 100
+
+    def handler(request):
+        wire_schema = json.loads(request.content)["generationConfig"]["responseJsonSchema"]
+        # Replay the observed rejection and acceptance. This mock is a regression
+        # fixture, not a general simulation of Google's schema complexity limits.
+        if wire_schema == rejected:
+            return httpx.Response(
+                400,
+                json={
+                    "error": {
+                        "status": "INVALID_ARGUMENT",
+                        "message": "Request contains an invalid argument.",
+                    }
+                },
+            )
+        assert wire_schema == corrected
+        return httpx.Response(200, json=gemini_completed('{"ok":true}'))
+
+    with monkeypatch.context() as patch:
+        patch.setattr(llm, "gemini_response_schema", lambda: rejected)
+        with pytest.raises(ProviderFailure) as error:
+            gemini_provider(handler).analyze({})
+        assert error.value.status_code == 502
+    assert gemini_provider(handler).analyze({}) == '{"ok":true}'
 
 
 @pytest.mark.parametrize(
