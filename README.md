@@ -209,6 +209,7 @@ If provider output fails any validation step, no report row is created.
 | Persistence | PostgreSQL 17, SQLAlchemy 2, psycopg 3 |
 | Provider HTTP | HTTPX |
 | AI providers | Google Gemini `generateContent`, OpenAI Responses API |
+| Dependency management | uv 0.13.1 with a universal lock |
 | Testing and quality | pytest, Ruff |
 | Runtime packaging | Docker, Docker Compose |
 
@@ -219,9 +220,15 @@ No Kafka, Kubernetes, Redis, vector database, provider SDK, or frontend is requi
 Requirements: Docker Desktop and PowerShell.
 
 ```powershell
-docker compose up --build -d
+docker compose build api
+docker compose up -d --wait db
+docker compose run --rm api python -m app.migrations upgrade
+docker compose up -d --wait api
 Invoke-RestMethod http://localhost:8000/health
 ```
+
+These commands assume a new empty database. For an existing unversioned database, complete the
+baseline procedure below before starting the updated API.
 
 Open the interactive API documentation at [http://localhost:8000/docs](http://localhost:8000/docs).
 
@@ -283,17 +290,68 @@ do not remove `tracemind_postgres_data`. Never add `--volumes` to this verificat
 
 ## Local Python setup
 
-Python 3.11+ and PostgreSQL are required. Docker can run only the database:
+Python 3.13 and PostgreSQL are used for the verified development workflow. Install the project-required
+uv version explicitly, then synchronize runtime and development dependencies from `uv.lock`:
 
 ```powershell
-python -m venv .venv
-.\.venv\Scripts\python.exe -m pip install -e '.[dev]'
+py -3.13 -m pip install --user uv==0.13.1
+uv --version
+uv lock --check
+uv sync --frozen --extra dev --python 3.13
 if (-not (Test-Path .env)) { Copy-Item .env.example .env }
 docker compose up -d db
-.\.venv\Scripts\python.exe -m uvicorn app.main:app --reload
+uv run --frozen uvicorn app.main:app --reload
 ```
 
-When using another PostgreSQL instance, set `DATABASE_URL` in `.env`. The database must already exist. Application startup creates missing tables and indexes with SQLAlchemy metadata. A migration framework is still needed before making production schema changes.
+`--frozen` makes `uv.lock` the installation source of truth and prevents an install or command from
+silently changing dependency resolution. `uv lock --check` separately verifies that the lock still
+matches `pyproject.toml`. The lock contains the runtime packages and the optional `dev` extra used by
+pytest and Ruff; Docker installs only the runtime subset.
+
+When using another PostgreSQL instance, set `DATABASE_URL` in `.env`. The database must already
+exist. Alembic owns the reviewable schema history. API startup verifies the recorded migration head
+and never creates, upgrades, or stamps the schema.
+
+## Database migrations
+
+The initial revision is `20261019_01`. On a new empty database, apply it before starting the API:
+
+```powershell
+uv run --frozen python -m app.migrations upgrade
+uv run --frozen alembic current
+uv run --frozen alembic check
+```
+
+`alembic check` must report no new upgrade operations after every model or migration change. The
+Docker image includes `alembic.ini` and the migration scripts, so the same commands can be used by a
+dedicated deployment migration job. For a new Docker database, run the migration command once before
+starting or restarting API replicas:
+
+```powershell
+docker compose run --rm api python -m app.migrations upgrade
+docker compose up -d --wait
+```
+
+The TraceMind migration command takes a PostgreSQL session advisory lock before upgrading and releases
+it after success or failure. PostgreSQL also releases the lock if the migration connection terminates.
+This serializes concurrent command invocations without holding a lock during normal API operation.
+API startup compares the database revision with the head loaded from the packaged Alembic scripts. An
+unbaselined, behind, incompatible, or unreachable database blocks startup with a sanitized error; the
+API never stamps or upgrades it automatically.
+
+An existing unversioned database must not run `alembic upgrade head`: the initial revision would try
+to create tables that already exist. Adopt migrations during a maintenance window instead:
+
+1. Back up the database and stop all application writes, API replicas, and migration runners.
+2. Compare its tables, columns, constraints, and indexes with the initial revision and current model
+   metadata. Resolve every difference explicitly.
+3. When the schemas match, run `alembic stamp 20261019_01` once. Stamping creates the version marker
+   without replaying the initial schema operations; it does not create, alter, or repair tables.
+4. Confirm `alembic current` reports `20261019_01 (head)` and `alembic check` reports no changes before
+   restarting application writes.
+
+Never use `stamp` merely to bypass a mismatch. It is safe only after the existing schema has been
+reviewed and confirmed equivalent to the revision being recorded.
 
 ## Configuration
 
@@ -320,6 +378,42 @@ Docker overrides `DATABASE_URL` inside the API container so it can reach the `db
 ```powershell
 docker compose up -d --build api
 ```
+
+The Dockerfile pins Python 3.13.16 and the uv 0.13.1 installer image by immutable multi-platform
+digest. Compose pins PostgreSQL 17.11 by digest. A tag keeps the selected version readable; the digest
+ensures a build or pull retrieves the reviewed image content.
+
+### Updating dependencies and images
+
+Make dependency updates deliberately from a clean working tree:
+
+```powershell
+uv --version
+uv lock --upgrade --python 3.13
+uv lock --check
+uv sync --frozen --extra dev --python 3.13
+uv run --frozen pytest -q
+uv run --frozen ruff check .
+uv run --frozen ruff format --check .
+```
+
+Review both `pyproject.toml` and `uv.lock`, including platform markers and unexpected transitive
+changes. To update a container base, inspect the registry manifest, place the verified tag and
+multi-platform digest in the Dockerfile or Compose file, then rebuild and run the complete checks:
+
+```powershell
+docker buildx imagetools inspect python:3.13.16-slim
+docker buildx imagetools inspect ghcr.io/astral-sh/uv:0.13.1
+docker buildx imagetools inspect postgres:17.11
+docker compose config --quiet
+docker compose build --no-cache api
+docker compose up -d --wait
+Invoke-RestMethod http://localhost:8000/health
+```
+
+Do not merge a lock or digest update until the PostgreSQL-backed test suite, Ruff checks, clean image
+build, and container health verification all pass. Image updates must not remove the existing
+`postgres_data` volume.
 
 ## Phase 1: log ingestion
 
@@ -518,9 +612,10 @@ The suite uses mocked provider transports; automated tests never make live Gemin
 ### Fast local suite
 
 ```powershell
-.\.venv\Scripts\python.exe -m pytest -q
-.\.venv\Scripts\python.exe -m ruff check .
-.\.venv\Scripts\python.exe -m ruff format --check .
+uv lock --check
+uv run --frozen pytest -q
+uv run --frozen ruff check .
+uv run --frozen ruff format --check .
 ```
 
 Without `TEST_DATABASE_URL`, tests use isolated in-memory SQLite databases.
@@ -532,7 +627,7 @@ Start the database and run tests against randomly named schemas. Existing applic
 ```powershell
 docker compose up -d db
 $env:TEST_DATABASE_URL = 'postgresql+psycopg://tracemind:tracemind@127.0.0.1:5432/tracemind?connect_timeout=5'
-.\.venv\Scripts\python.exe -m pytest -q
+uv run --frozen pytest -q
 Remove-Item Env:\TEST_DATABASE_URL
 ```
 
@@ -541,7 +636,7 @@ The database user must be allowed to create and drop schemas.
 ### Focused RCA and provider suite
 
 ```powershell
-.\.venv\Scripts\python.exe -m pytest tests/test_llm.py tests/test_rca.py -q
+uv run --frozen pytest tests/test_llm.py tests/test_rca.py -q
 ```
 
 ### Deterministic RCA benchmark
@@ -549,7 +644,7 @@ The database user must be allowed to create and drop schemas.
 Run the fixture-backed RCA contract benchmark without provider credentials or network access:
 
 ```powershell
-.\.venv\Scripts\python.exe -m pytest -m rca_benchmark -q
+uv run --frozen pytest -m rca_benchmark -q
 ```
 
 The benchmark reuses the main RCA regression tests for a valid hypothesis, the local no-evidence
@@ -560,8 +655,8 @@ persistence. It checks deterministic contract behavior rather than subjective ca
 Run the same static checks used for RCA changes:
 
 ```powershell
-.\.venv\Scripts\python.exe -m ruff check app/rca.py app/rca_schemas.py app/llm.py tests/test_rca.py tests/test_llm.py
-.\.venv\Scripts\python.exe -m ruff format --check app/rca.py app/rca_schemas.py app/llm.py tests/test_rca.py tests/test_llm.py
+uv run --frozen ruff check app/rca.py app/rca_schemas.py app/llm.py tests/test_rca.py tests/test_llm.py
+uv run --frozen ruff format --check app/rca.py app/rca_schemas.py app/llm.py tests/test_rca.py tests/test_llm.py
 git diff --check
 ```
 
@@ -590,7 +685,8 @@ Incident IDs, statuses, logs, and saved RCA reports should remain available. Run
 - Burst detection uses a fixed threshold, not a learned baseline.
 - Identifier equality and temporal order are correlation evidence, not causal proof.
 - There is no authentication, authorization, tenant isolation, rate limiting, or audit identity.
-- Table creation uses SQLAlchemy metadata; production schema migrations are not configured.
+- API startup verifies the Alembic head but does not apply migrations. Existing unversioned databases
+  require the documented one-time schema review and baseline before the updated API can start.
 - There is no semantic search over previous incidents or verified resolution knowledge base.
 - There is no dashboard or background worker.
 - The deterministic RCA benchmark uses mocked providers and fixed fixtures. It does not evaluate live-provider behavior, causal accuracy, throughput, or latency.

@@ -6,9 +6,9 @@ from types import SimpleNamespace
 
 import pytest
 from fastapi.testclient import TestClient
-from sqlalchemy.exc import SQLAlchemyError
 
 from app import main
+from app.migrations import MigrationStateError
 
 PROJECT_ROOT = Path(__file__).parents[1]
 
@@ -31,23 +31,33 @@ def test_malformed_database_url_fails_during_engine_creation():
     assert "Could not parse SQLAlchemy URL" in result.stderr
 
 
-def test_database_unavailable_during_startup_fails_lifespan(monkeypatch):
-    def unavailable(bind):
-        raise SQLAlchemyError("database unavailable during startup")
+def test_database_unavailable_during_startup_fails_lifespan(monkeypatch, caplog):
+    runtime_engine = SimpleNamespace(dispose=lambda: None)
 
-    monkeypatch.setattr(main.Base.metadata, "create_all", unavailable)
+    def unavailable(bind):
+        raise MigrationStateError("Database migration state could not be verified")
+
+    monkeypatch.setattr(main, "engine", runtime_engine)
+    monkeypatch.setattr(main, "verify_database_revision", unavailable)
+    caplog.set_level("ERROR", logger="app.main")
 
     with (
-        pytest.raises(SQLAlchemyError, match="database unavailable during startup"),
+        pytest.raises(
+            RuntimeError,
+            match="Application startup blocked: Database migration state could not be verified",
+        ),
         TestClient(main.app),
     ):
         pass
+
+    assert "event=startup_failed category=migration_state" in caplog.text
+    assert "credentials" not in caplog.text
 
 
 def test_provider_configuration_is_validated_lazily_on_rca_request(monkeypatch):
     runtime_engine = SimpleNamespace(dispose=lambda: None)
     monkeypatch.setattr(main, "engine", runtime_engine)
-    monkeypatch.setattr(main.Base.metadata, "create_all", lambda bind: None)
+    monkeypatch.setattr(main, "verify_database_revision", lambda bind: None)
     monkeypatch.setenv("RCA_PROVIDER", "disabled")
 
     with TestClient(main.app) as client:

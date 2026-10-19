@@ -1,3 +1,4 @@
+import logging
 from contextlib import asynccontextmanager
 from datetime import datetime
 from typing import Annotated
@@ -8,8 +9,9 @@ from sqlalchemy import func, select, text
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session
 
-from app.database import Base, engine, get_session
+from app.database import engine, get_session
 from app.incidents import router as incidents_router
+from app.migrations import MigrationStateError, verify_database_revision
 from app.models import LogRecord
 from app.rca_routes import router as rca_router
 from app.schemas import (
@@ -22,13 +24,21 @@ from app.schemas import (
     utc_timestamp,
 )
 
+logger = logging.getLogger(__name__)
+
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # Phases 2–3 are additive: new tables only, with no changes to existing log columns.
-    Base.metadata.create_all(engine)
-    yield
-    engine.dispose()
+    try:
+        verify_database_revision(engine)
+    except MigrationStateError as exc:
+        logger.error("event=startup_failed category=migration_state")
+        engine.dispose()
+        raise RuntimeError(f"Application startup blocked: {exc}") from None
+    try:
+        yield
+    finally:
+        engine.dispose()
 
 
 app = FastAPI(title="TraceMind", version="0.3.0", lifespan=lifespan)

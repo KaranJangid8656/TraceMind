@@ -1,5 +1,5 @@
 [build-system]
-requires = ["setuptools>=75"]
+requires = ["setuptools==84.0.0"]
 build-backend = "setuptools.build_meta"
 
 [project]
@@ -8,6 +8,7 @@ version = "0.3.0"
 description = "TraceMind incident correlation and evidence-backed AI-assisted RCA API"
 requires-python = ">=3.11"
 dependencies = [
+    "alembic>=1.20,<2",
     "fastapi>=0.115,<1",
     "uvicorn[standard]>=0.34,<1",
     "pydantic-settings>=2.7,<3",
@@ -31,3 +32,6 @@ markers = [
 [tool.ruff]
 line-length = 100
 target-version = "py311"
+
+[tool.uv]
+required-version = "==0.13.1"
