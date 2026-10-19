@@ -1,6 +1,7 @@
 services:
   db:
     image: postgres:17
+    restart: unless-stopped
     environment:
       POSTGRES_USER: tracemind
       POSTGRES_PASSWORD: tracemind
@@ -16,6 +17,7 @@ services:
       retries: 10
   api:
     build: .
+    restart: unless-stopped
     env_file:
       - path: .env
         required: false
@@ -23,6 +25,18 @@ services:
       DATABASE_URL: postgresql+psycopg://tracemind:tracemind@db:5432/tracemind
     ports:
       - "127.0.0.1:8000:8000"
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "python",
+          "-c",
+          "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=3).read()",
+        ]
+      interval: 5s
+      timeout: 5s
+      start_period: 10s
+      retries: 5
     depends_on:
       db:
         condition: service_healthy

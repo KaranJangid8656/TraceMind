@@ -18,7 +18,7 @@ class Settings(BaseSettings):
     openai_api_key: SecretStr | None = None
     openai_model: str = Field(default="", max_length=200)
     gemini_api_key: SecretStr | None = None
-    gemini_model: str = Field(default="", max_length=200)
+    gemini_model: str = Field(default="gemini-3.5-flash-lite", max_length=200)
     rca_timeout_seconds: float = Field(default=30, ge=1, le=120)
     rca_max_logs: int = Field(default=40, ge=1, le=100)
     rca_max_evidence_chars: int = Field(default=40000, ge=2000, le=100000)

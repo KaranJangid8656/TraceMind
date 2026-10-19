@@ -26,6 +26,12 @@ def test_rca_v2_prompt_requires_exact_hypothesis_match():
     assert "not a paraphrase" in INSTRUCTIONS
 
 
+def test_gemini_model_has_documented_default(monkeypatch):
+    monkeypatch.delenv("GEMINI_MODEL", raising=False)
+
+    assert Settings(_env_file=None).gemini_model == "gemini-3.5-flash-lite"
+
+
 def provider(handler):
     settings = Settings(
         _env_file=None,

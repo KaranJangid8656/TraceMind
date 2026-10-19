@@ -2,6 +2,10 @@ import json
 from pathlib import Path
 
 import pytest
+from sqlalchemy.exc import SQLAlchemyError
+
+from app.database import get_session
+from app.main import app
 
 SAMPLE = json.loads((Path(__file__).parents[1] / "data" / "sample_logs.json").read_text())
 
@@ -92,3 +96,24 @@ def test_invalid_filters(client, params):
 
 def test_health(client):
     assert client.get("/health").json() == {"status": "ok"}
+
+
+def test_health_returns_controlled_response_when_database_is_unavailable(client):
+    original_session = app.dependency_overrides[get_session]
+
+    class UnavailableSession:
+        def execute(self, statement):
+            raise SQLAlchemyError("private database connection details")
+
+    def unavailable_session():
+        yield UnavailableSession()
+
+    app.dependency_overrides[get_session] = unavailable_session
+    try:
+        response = client.get("/health")
+    finally:
+        app.dependency_overrides[get_session] = original_session
+
+    assert response.status_code == 503
+    assert response.json() == {"detail": "Database unavailable"}
+    assert "private database connection details" not in response.text

@@ -225,7 +225,10 @@ Invoke-RestMethod http://localhost:8000/health
 
 Open the interactive API documentation at [http://localhost:8000/docs](http://localhost:8000/docs).
 
-The Compose stack exposes the API and PostgreSQL only on localhost. Database data persists in the `postgres_data` volume. The included database credentials are for local development. The API has no authentication and should not be exposed publicly.
+The Compose stack exposes the API and PostgreSQL only on localhost. Database data persists in the
+Compose volume `postgres_data`, named `tracemind_postgres_data` when the default project name is
+used. The included database credentials are for local development. The API has no authentication
+and should not be exposed publicly.
 
 Useful lifecycle commands:
 
@@ -236,7 +239,47 @@ docker compose restart api
 docker compose down
 ```
 
+Both services use `restart: unless-stopped`. Docker restarts them after a process, daemon, or host
+restart, while an explicit `docker compose stop` keeps them stopped. `docker compose down` still
+removes the containers and network normally while preserving the named database volume.
+
+`docker compose ps` reports `(healthy)` for both `db` and `api` when PostgreSQL accepts connections
+and the API's internal `http://127.0.0.1:8000/health` probe returns HTTP 200. The API probe uses the
+Python standard library included in the image; HTTP 503 and connection failures make the container
+unhealthy. Inspect the latest probe output when troubleshooting:
+
+```powershell
+docker inspect --format='{{json .State.Health}}' tracemind-api-1
+docker compose logs --tail 100 api db
+```
+
 `docker compose down` preserves the named database volume. Do not add `--volumes` when you want to retain data.
+
+To verify persistence with a harmless log record, save its returned ID and retrieve it after both a
+restart and a container recreation:
+
+```powershell
+$marker = "phase5-persistence-$([DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds())"
+$body = @{ logs = @(@{
+  timestamp = [DateTime]::UtcNow.ToString('o')
+  service = $marker
+  severity = 'INFO'
+  message = 'Phase 5 persistence verification'
+}) } | ConvertTo-Json -Depth 4
+$record = (Invoke-RestMethod -Method Post -Uri http://localhost:8000/logs `
+  -ContentType 'application/json' -Body $body)[0]
+
+docker compose restart db
+docker compose up -d --wait
+(Invoke-RestMethod "http://localhost:8000/logs?service=$marker").items.id
+
+docker compose up -d --force-recreate db
+docker compose up -d --wait
+(Invoke-RestMethod "http://localhost:8000/logs?service=$marker").items.id
+```
+
+Both retrieved IDs should equal `$record.id`. These commands recreate the PostgreSQL container but
+do not remove `tracemind_postgres_data`. Never add `--volumes` to this verification workflow.
 
 ## Local Python setup
 
