@@ -1,19 +1,17 @@
 # TraceMind
 
-TraceMind is an incident-investigation backend that ingests structured application logs, groups related failures into incidents, and generates evidence-backed root-cause hypotheses. It combines deterministic correlation with optional LLM analysis while preserving the original logs and clearly labeling causality as unconfirmed.
+## Overview
 
-The repository currently implements Phases 1–3:
+TraceMind is an incident-investigation backend that ingests structured application logs, groups
+related failures into incidents, and generates evidence-backed root-cause hypotheses. It combines
+deterministic correlation with optional LLM analysis while preserving original evidence and clearly
+labeling causality as unconfirmed.
 
-| Phase | Capability | Status |
-|---|---|---|
-| 1 | Validated log ingestion, normalization, storage, filtering, and pagination | Complete |
-| 2 | Deterministic incident detection, cross-service correlation, evidence storage, and incident lifecycle | Complete |
-| 3 | Structured AI-assisted RCA with Gemini or OpenAI, strict validation, citations, and report persistence | Complete |
-| 4 | Future expansion | Deferred |
+The current implementation includes validated log ingestion, deterministic incident detection,
+strictly validated Gemini or OpenAI RCA reports, immutable evidence snapshots, structured diagnostics,
+reproducible dependencies and container images, and explicit Alembic migration management.
 
-Phase 4 will be designed and implemented later. Historical semantic retrieval, verified-resolution feedback, a React dashboard, background queues, and automated remediation are not part of the current application.
-
-## Why TraceMind
+### Why TraceMind
 
 A log viewer can show that several services failed near the same time, but it does not explain whether the failures belong to the same incident or which evidence supports a possible cause. TraceMind separates that work into two controlled stages:
 
@@ -103,13 +101,13 @@ flowchart TB
 
 ```mermaid
 erDiagram
-    LOG_RECORDS ||--o| INCIDENT_LOGS : assigned_through
+    LOGS ||--o| INCIDENT_LOGS : assigned_through
     INCIDENTS ||--o{ INCIDENT_LOGS : contains
     INCIDENTS ||--o{ RCA_REPORTS : analyzed_as
     INCIDENTS ||--o{ INCIDENT_LINKS : source
     INCIDENTS ||--o{ INCIDENT_LINKS : target
 
-    LOG_RECORDS {
+    LOGS {
         bigint id PK
         timestamptz timestamp
         string service
@@ -200,7 +198,187 @@ sequenceDiagram
 
 If provider output fails any validation step, no report row is created.
 
-## Technology stack
+## Key Features
+
+### Log ingestion
+
+#### Log contract
+
+`POST /logs` accepts an object containing a `logs` array with 1–1,000 records. Every record requires `timestamp`, `service`, `severity`, and `message`. Optional fields are `request_id`, `trace_id`, and `exception_type`. Unknown fields are rejected. Validation is atomic: one invalid entry rejects the complete batch with HTTP 422.
+
+Normalization rules:
+
+- Timestamps must contain timezone information and are stored and returned in UTC.
+- Service names are trimmed, lowercased, and normalized from spaces or underscores to hyphens.
+- Services may contain letters, digits, dots, and hyphens and are limited to 100 characters.
+- Severity is case insensitive. `WARN` becomes `WARNING`; `FATAL` becomes `CRITICAL`.
+- Messages are trimmed, required to be nonempty, and limited to 32,000 characters.
+- Optional identifiers must be nonempty when supplied and are limited to 200 characters.
+
+Ingestion does not deduplicate records. Repeating the same request stores another set of observations.
+
+#### Ingest and query sample logs
+
+```powershell
+$sampleBody = Get-Content -Raw data/sample_logs.json
+Invoke-RestMethod -Method Post -Uri http://localhost:8000/logs `
+  -ContentType 'application/json' -Body $sampleBody
+
+Invoke-RestMethod 'http://localhost:8000/logs?service=payment-service&severity=ERROR&limit=20&offset=0'
+Invoke-RestMethod 'http://localhost:8000/logs?start=2026-10-17T10:00:01Z&end=2026-10-17T10:00:03Z'
+```
+
+`GET /logs` supports combinable `service`, `severity`, inclusive `start`, inclusive `end`, `limit`, and `offset` parameters. Results sort by timestamp and then ID in ascending order. Encode `+` as `%2B` when a timestamp with a positive offset appears in a URL.
+
+### Incident detection and correlation
+
+Detection is explicit. Call it after ingestion:
+
+```powershell
+$detection = Invoke-RestMethod -Method Post http://localhost:8000/incidents/detect
+$incidents = Invoke-RestMethod http://localhost:8000/incidents
+$incidents.items | Format-Table id, title, severity, status, occurrence_count
+$incidentId = $incidents.items[0].id
+Invoke-RestMethod "http://localhost:8000/incidents/$incidentId"
+```
+
+The detector processes unassigned logs and returns counts for created incidents, assigned logs, and weak relationships. Existing Phase 1 logs can be detected without being submitted again.
+
+#### Correlation precedence and safeguards
+
+1. Exact `trace_id` matches provide the strongest grouping rule.
+2. Exact `request_id` matches are used when trace evidence does not conflict.
+3. Different nonempty trace IDs prevent grouping through a shared request ID.
+4. An incident has a fixed maximum span controlled by `CORRELATION_WINDOW_SECONDS`; chains of nearby events cannot extend it indefinitely.
+5. Identifier-free errors can group only when service, exception type, and normalized message fingerprint match within the window.
+6. Fingerprinting normalizes changing numeric values, UUIDs, and hexadecimal addresses so repeated forms of one error can group.
+7. ERROR and CRITICAL logs seed incidents. Lower-severity records attach only as identifier-matched context.
+8. Repeated fingerprints, multi-service traces, and error bursts add transparent detection signals.
+9. A timeout or latency event in a downstream service may link to an earlier dependency failure as weak evidence. It does not merge the incidents or prove causality.
+10. Conflicting request or trace identifiers block weak dependency links.
+
+The sample dataset groups the database and payment errors sharing `trace-payment-001`. Its unrelated user-service warning remains queryable but does not seed that incident.
+
+Detection is idempotent for stored log IDs. It does not reassign or retroactively merge existing incidents. New failures do not attach to resolved incidents; recurrence creates another incident.
+
+#### Incident lifecycle
+
+Statuses are `open`, `investigating`, and `resolved`.
+
+```powershell
+Invoke-RestMethod 'http://localhost:8000/incidents?service=payment-service&status=open&limit=10'
+
+Invoke-RestMethod -Method Patch -Uri "http://localhost:8000/incidents/$incidentId" `
+  -ContentType 'application/json' -Body '{"status":"investigating"}'
+
+Invoke-RestMethod -Method Patch -Uri "http://localhost:8000/incidents/$incidentId" `
+  -ContentType 'application/json' -Body '{"status":"resolved"}'
+```
+
+A status change records workflow state only. It does not confirm a cause or save a verified resolution.
+
+### Evidence-backed AI-assisted RCA
+
+Phase 3 builds a bounded evidence package from an existing incident and asks the selected provider for a strict JSON report. The backend then validates that report before saving it.
+
+#### RCA pipeline
+
+1. Load the incident, its original logs, membership reasons, detection rules, and eligible weak relationships.
+2. Select ERROR/CRITICAL logs first, followed by lower-severity context, while applying log-count and character limits.
+3. Record evidence omissions and truncation as explicit evidence gaps.
+4. Send the evidence and system instructions to the selected provider.
+5. Decode and validate the response with `RCAOutput`.
+6. Verify every cited log ID belongs to the supplied evidence snapshot and reject duplicate citation IDs.
+7. Reject invented services, overlapping supporting/contradicting citations, invalid ranks, unsupported statuses, and unknown fields.
+8. For a hypothesis, require at least one observed fact, reject duplicate cause text case-insensitively, and require confidence to be non-increasing by rank.
+9. Require `probable_cause` to equal the first ranked cause and require its top-level citation list to match the first cause's citations exactly, including order.
+10. Convert a report with contradictory evidence on its first-ranked cause to inconclusive, clear the selected cause and top-level citations, and lower confidence.
+11. Merge snapshot omission and truncation gaps into the final report, remove duplicates while preserving order, and keep at most 20 gaps.
+12. Persist the analysis, evidence snapshot, hash, provider, model, prompt version, validation notes, and total duration in one report transaction.
+
+Reports can have `hypothesis` or `inconclusive` status. They cannot claim `confirmed`. Every API response retains `causality: "unconfirmed"`.
+
+#### Gemini configuration
+
+```dotenv
+RCA_PROVIDER=gemini
+GEMINI_API_KEY=your-local-key
+GEMINI_MODEL=gemini-3.5-flash-lite
+RCA_TIMEOUT_SECONDS=30
+RCA_MAX_LOGS=40
+RCA_MAX_EVIDENCE_CHARS=40000
+RCA_MAX_OUTPUT_TOKENS=4000
+```
+
+The adapter uses Google's official `v1beta/models/{model}:generateContent` endpoint through HTTPX. It sends the key in the `x-goog-api-key` header and uses native `systemInstruction`, `contents`, and `generationConfig` fields. JSON output is requested with `responseMimeType: application/json` and a translated `responseJsonSchema`.
+
+The generated schema retains closed objects, required fields, enums, nullability, minimum array sizes, root array limits, and numeric rank bounds. Controlled live testing found that Google's schema validator rejected the complete RCA schema when three nested citation arrays included `maxItems`. Those three generation-time bounds are omitted, while the unchanged Pydantic model still enforces their 100-ID limits before persistence. Details and probe results are recorded in [docs/gemini-investigation.md](docs/gemini-investigation.md).
+
+Only one candidate ending with `STOP` is accepted. Blocked, incomplete, empty, oversized, malformed, or unexpected responses are rejected. There are no automatic retries, provider fallbacks, model switches, tools, or search calls.
+
+Gemini availability, free-tier eligibility, and limits depend on the Google project. Consult [Gemini pricing](https://ai.google.dev/gemini-api/docs/pricing), [rate limits](https://ai.google.dev/gemini-api/docs/rate-limits), and [structured output documentation](https://ai.google.dev/gemini-api/docs/generate-content/structured-output).
+
+#### OpenAI configuration
+
+```dotenv
+RCA_PROVIDER=openai
+OPENAI_API_KEY=your-local-key
+OPENAI_MODEL=your-structured-output-capable-model
+RCA_TIMEOUT_SECONDS=30
+RCA_MAX_LOGS=40
+RCA_MAX_EVIDENCE_CHARS=40000
+RCA_MAX_OUTPUT_TOKENS=4000
+```
+
+The OpenAI adapter uses the Responses API with strict structured output and `store: false`. Only the selected provider requires credentials. Set `RCA_PROVIDER=disabled` to stop new analyses while keeping saved reports readable.
+
+#### Generate and retrieve an RCA report
+
+```powershell
+$incidentId = 1
+$report = Invoke-RestMethod -Method Post `
+  -Uri "http://localhost:8000/incidents/$incidentId/analyze" `
+  -ContentType 'application/json' -Body '{"max_logs":40}'
+
+$report.analysis | ConvertTo-Json -Depth 10
+Invoke-RestMethod "http://localhost:8000/incidents/$incidentId/analyses?limit=20&offset=0"
+Invoke-RestMethod "http://localhost:8000/incidents/$incidentId/analyses/$($report.id)"
+```
+
+The request body is optional. `max_logs` must be between 1 and 100 and cannot exceed the server limit. Every successful request creates a new immutable report and makes a provider call when usable evidence exists. Retrieval never calls the provider.
+
+New reports use prompt version `rca-v2`, which explicitly requires the probable cause to be a verbatim copy of the first ranked cause. Existing reports retain the prompt version stored at creation.
+
+#### Trust and failure boundaries
+
+- Logs, identifiers, exception text, and incident titles are treated as untrusted data, not instructions.
+- Provider credentials are never put in URLs, response bodies, or application diagnostics.
+- Public failures do not expose provider bodies, authorization headers, incident evidence, or API keys.
+- Gemini diagnostics log only HTTP status, an allowlisted provider status, and a bounded classified description.
+- OpenAI diagnostics use fixed failure categories and omit response bodies and exception details.
+- RCA orchestration records provider-call elapsed time with a monotonic clock for successful and failed calls. Validation and persistence failures use stable categories.
+- Diagnostic records include bounded provider, model, prompt-version, status, and timing fields where applicable. They exclude full prompts, raw evidence, raw provider output, authorization headers, API keys, and unsanitized response bodies.
+- Provider response envelopes and extracted report text have hard size limits.
+- Report metadata is created only after provider output passes validation. A report is returned and logged as persisted only after the database commit succeeds; persistence errors roll back and retain the controlled API error.
+- Failed calls, rejected output, and failed commits do not leave report rows.
+- A cited log proves only that the log was supplied and referenced; human review is still required to judge whether it supports the claim.
+
+Provider requests send selected incident evidence to the configured external service. Review log contents and the provider's data terms before enabling RCA.
+
+### Reliability and deterministic validation
+
+Phase 4's deterministic RCA validation and reliability audit is complete. The implemented boundary
+includes ordered citation consistency, observed-fact requirements for hypotheses, duplicate-cause
+rejection, non-increasing confidence by rank, contradictory-evidence handling, normalized evidence
+gaps, persistence rollback coverage, immutable report metadata, sanitized structured diagnostics,
+provider no-retry tests, and the fixture-backed `rca_benchmark` suite.
+
+This phase establishes repeatable contract validation and failure handling. It does not establish
+that a provider's proposed cause is correct, compare model quality, benchmark request throughput or
+latency, exercise live provider services, add reviewed causes or resolutions, or make RCA processing
+asynchronous. Those remain separate product and evaluation concerns.
+
+## Tech Stack
 
 | Area | Technology |
 |---|---|
@@ -215,9 +393,18 @@ If provider output fails any validation step, no report row is created.
 
 No Kafka, Kubernetes, Redis, vector database, provider SDK, or frontend is required by the current implementation.
 
-## Quick start with Docker
+## Prerequisites
 
-Requirements: Docker Desktop and PowerShell.
+- Docker Desktop with Docker Compose for the container workflow.
+- PowerShell for the documented Windows commands.
+- Python 3.13 and uv 0.13.1 for local development outside Docker.
+- PostgreSQL 17 for local database-backed development and testing.
+- A Gemini or OpenAI API key only when explicitly enabling that provider. Log ingestion,
+  correlation, stored-report retrieval, and the automated tests do not require provider credentials.
+
+## Getting Started
+
+### Docker
 
 ```powershell
 docker compose build api
@@ -288,7 +475,7 @@ docker compose up -d --wait
 Both retrieved IDs should equal `$record.id`. These commands recreate the PostgreSQL container but
 do not remove `tracemind_postgres_data`. Never add `--volumes` to this verification workflow.
 
-## Local Python setup
+### Local development
 
 Python 3.13 and PostgreSQL are used for the verified development workflow. Install the project-required
 uv version explicitly, then synchronize runtime and development dependencies from `uv.lock`:
@@ -312,7 +499,108 @@ When using another PostgreSQL instance, set `DATABASE_URL` in `.env`. The databa
 exist. Alembic owns the reviewable schema history. API startup verifies the recorded migration head
 and never creates, upgrades, or stamps the schema.
 
-## Database migrations
+### Persistence verification
+
+```powershell
+$before = Invoke-RestMethod http://localhost:8000/incidents
+docker compose restart api
+Invoke-RestMethod http://localhost:8000/health
+$after = Invoke-RestMethod http://localhost:8000/incidents
+```
+
+Incident IDs, statuses, logs, and saved RCA reports should remain available. Running detection again without new logs should produce zero new assignments.
+
+### Updating dependencies and images
+
+Make dependency updates deliberately from a clean working tree:
+
+```powershell
+uv --version
+uv lock --upgrade --python 3.13
+uv lock --check
+uv sync --frozen --extra dev --python 3.13
+uv run --frozen pytest -q
+uv run --frozen ruff check .
+uv run --frozen ruff format --check .
+```
+
+Review both `pyproject.toml` and `uv.lock`, including platform markers and unexpected transitive
+changes. To update a container base, inspect the registry manifest, place the verified tag and
+multi-platform digest in the Dockerfile or Compose file, then rebuild and run the complete checks:
+
+```powershell
+docker buildx imagetools inspect python:3.13.16-slim
+docker buildx imagetools inspect ghcr.io/astral-sh/uv:0.13.1
+docker buildx imagetools inspect postgres:17.11
+docker compose config --quiet
+docker compose build --no-cache api
+docker compose up -d --wait
+Invoke-RestMethod http://localhost:8000/health
+```
+
+Do not merge a lock or digest update until the PostgreSQL-backed test suite, Ruff checks, clean image
+build, and container health verification all pass. Image updates must not remove the existing
+`postgres_data` volume.
+
+## Environment Variables
+
+Copy `.env.example` to `.env` and edit it locally. Never commit `.env` or API keys.
+
+| Variable | Default | Purpose |
+|---|---:|---|
+| `DATABASE_URL` | Local TraceMind PostgreSQL URL | SQLAlchemy connection URL |
+| `CORRELATION_WINDOW_SECONDS` | `300` | Maximum fixed span for one incident |
+| `ERROR_BURST_THRESHOLD` | `5` | Error count that adds a burst signal |
+| `SERVICE_DEPENDENCIES` | Payment/user to database | JSON map from downstream service to upstream dependencies |
+| `RCA_PROVIDER` | `disabled` | `disabled`, `gemini`, or `openai` |
+| `GEMINI_API_KEY` | Empty | Gemini credential used only when Gemini is selected |
+| `GEMINI_MODEL` | `gemini-3.5-flash-lite` | Gemini model ID |
+| `OPENAI_API_KEY` | Empty | OpenAI credential used only when OpenAI is selected |
+| `OPENAI_MODEL` | Empty | Structured-output-capable OpenAI model |
+| `RCA_TIMEOUT_SECONDS` | `30` | Provider network timeout |
+| `RCA_MAX_LOGS` | `40` | Maximum selected logs per analysis |
+| `RCA_MAX_EVIDENCE_CHARS` | `40000` | Maximum compact evidence JSON size |
+| `RCA_MAX_OUTPUT_TOKENS` | `4000` | Provider output-token limit |
+
+Docker overrides `DATABASE_URL` inside the API container so it can reach the `db` service. Rebuild or recreate the API after changing provider settings:
+
+```powershell
+docker compose up -d --build api
+```
+
+The Dockerfile pins Python 3.13.16 and the uv 0.13.1 installer image by immutable multi-platform
+digest. Compose pins PostgreSQL 17.11 by digest. A tag keeps the selected version readable; the digest
+ensures a build or pull retrieves the reviewed image content.
+
+## API Endpoints
+
+| Method | Endpoint | Purpose |
+|---|---|---|
+| GET | `/health` | Check API and database readiness |
+| POST | `/logs` | Validate, normalize, and store a log batch |
+| GET | `/logs` | Filter and paginate stored logs |
+| POST | `/incidents/detect` | Run deterministic detection over unassigned logs |
+| GET | `/incidents` | Filter and paginate incidents |
+| GET | `/incidents/{id}` | Retrieve an incident timeline, evidence, and relationships |
+| PATCH | `/incidents/{id}` | Change incident workflow status |
+| POST | `/incidents/{id}/analyze` | Generate, validate, and save an RCA report |
+| GET | `/incidents/{id}/analyses` | Retrieve paginated report history, newest first |
+| GET | `/incidents/{id}/analyses/{report_id}` | Retrieve one report and its evidence snapshot |
+
+Common error behavior:
+
+| Status | Meaning |
+|---:|---|
+| 404 | Requested incident or report does not exist |
+| 422 | Request validation failed |
+| 502 | Provider/configuration error, refused or malformed output, or failed RCA validation |
+| 503 | Database unavailable, RCA disabled, missing provider configuration, or provider quota/rate limit |
+| 504 | Provider request timed out |
+
+Interactive OpenAPI documentation is available at
+[http://localhost:8000/docs](http://localhost:8000/docs) while the API is running.
+
+## Database Migrations
 
 The initial revision is `20261019_01`. On a new empty database, apply it before starting the API:
 
@@ -353,259 +641,7 @@ to create tables that already exist. Adopt migrations during a maintenance windo
 Never use `stamp` merely to bypass a mismatch. It is safe only after the existing schema has been
 reviewed and confirmed equivalent to the revision being recorded.
 
-## Configuration
-
-Copy `.env.example` to `.env` and edit it locally. Never commit `.env` or API keys.
-
-| Variable | Default | Purpose |
-|---|---:|---|
-| `DATABASE_URL` | Local TraceMind PostgreSQL URL | SQLAlchemy connection URL |
-| `CORRELATION_WINDOW_SECONDS` | `300` | Maximum fixed span for one incident |
-| `ERROR_BURST_THRESHOLD` | `5` | Error count that adds a burst signal |
-| `SERVICE_DEPENDENCIES` | Payment/user to database | JSON map from downstream service to upstream dependencies |
-| `RCA_PROVIDER` | `disabled` | `disabled`, `gemini`, or `openai` |
-| `GEMINI_API_KEY` | Empty | Gemini credential used only when Gemini is selected |
-| `GEMINI_MODEL` | `gemini-3.5-flash-lite` | Gemini model ID |
-| `OPENAI_API_KEY` | Empty | OpenAI credential used only when OpenAI is selected |
-| `OPENAI_MODEL` | Empty | Structured-output-capable OpenAI model |
-| `RCA_TIMEOUT_SECONDS` | `30` | Provider network timeout |
-| `RCA_MAX_LOGS` | `40` | Maximum selected logs per analysis |
-| `RCA_MAX_EVIDENCE_CHARS` | `40000` | Maximum compact evidence JSON size |
-| `RCA_MAX_OUTPUT_TOKENS` | `4000` | Provider output-token limit |
-
-Docker overrides `DATABASE_URL` inside the API container so it can reach the `db` service. Rebuild or recreate the API after changing provider settings:
-
-```powershell
-docker compose up -d --build api
-```
-
-The Dockerfile pins Python 3.13.16 and the uv 0.13.1 installer image by immutable multi-platform
-digest. Compose pins PostgreSQL 17.11 by digest. A tag keeps the selected version readable; the digest
-ensures a build or pull retrieves the reviewed image content.
-
-### Updating dependencies and images
-
-Make dependency updates deliberately from a clean working tree:
-
-```powershell
-uv --version
-uv lock --upgrade --python 3.13
-uv lock --check
-uv sync --frozen --extra dev --python 3.13
-uv run --frozen pytest -q
-uv run --frozen ruff check .
-uv run --frozen ruff format --check .
-```
-
-Review both `pyproject.toml` and `uv.lock`, including platform markers and unexpected transitive
-changes. To update a container base, inspect the registry manifest, place the verified tag and
-multi-platform digest in the Dockerfile or Compose file, then rebuild and run the complete checks:
-
-```powershell
-docker buildx imagetools inspect python:3.13.16-slim
-docker buildx imagetools inspect ghcr.io/astral-sh/uv:0.13.1
-docker buildx imagetools inspect postgres:17.11
-docker compose config --quiet
-docker compose build --no-cache api
-docker compose up -d --wait
-Invoke-RestMethod http://localhost:8000/health
-```
-
-Do not merge a lock or digest update until the PostgreSQL-backed test suite, Ruff checks, clean image
-build, and container health verification all pass. Image updates must not remove the existing
-`postgres_data` volume.
-
-## Phase 1: log ingestion
-
-### Log contract
-
-`POST /logs` accepts an object containing a `logs` array with 1–1,000 records. Every record requires `timestamp`, `service`, `severity`, and `message`. Optional fields are `request_id`, `trace_id`, and `exception_type`. Unknown fields are rejected. Validation is atomic: one invalid entry rejects the complete batch with HTTP 422.
-
-Normalization rules:
-
-- Timestamps must contain timezone information and are stored and returned in UTC.
-- Service names are trimmed, lowercased, and normalized from spaces or underscores to hyphens.
-- Services may contain letters, digits, dots, and hyphens and are limited to 100 characters.
-- Severity is case insensitive. `WARN` becomes `WARNING`; `FATAL` becomes `CRITICAL`.
-- Messages are trimmed, required to be nonempty, and limited to 32,000 characters.
-- Optional identifiers must be nonempty when supplied and are limited to 200 characters.
-
-Ingestion does not deduplicate records. Repeating the same request stores another set of observations.
-
-### Ingest and query sample logs
-
-```powershell
-$sampleBody = Get-Content -Raw data/sample_logs.json
-Invoke-RestMethod -Method Post -Uri http://localhost:8000/logs `
-  -ContentType 'application/json' -Body $sampleBody
-
-Invoke-RestMethod 'http://localhost:8000/logs?service=payment-service&severity=ERROR&limit=20&offset=0'
-Invoke-RestMethod 'http://localhost:8000/logs?start=2026-10-17T10:00:01Z&end=2026-10-17T10:00:03Z'
-```
-
-`GET /logs` supports combinable `service`, `severity`, inclusive `start`, inclusive `end`, `limit`, and `offset` parameters. Results sort by timestamp and then ID in ascending order. Encode `+` as `%2B` when a timestamp with a positive offset appears in a URL.
-
-## Phase 2: incident detection and correlation
-
-Detection is explicit. Call it after ingestion:
-
-```powershell
-$detection = Invoke-RestMethod -Method Post http://localhost:8000/incidents/detect
-$incidents = Invoke-RestMethod http://localhost:8000/incidents
-$incidents.items | Format-Table id, title, severity, status, occurrence_count
-$incidentId = $incidents.items[0].id
-Invoke-RestMethod "http://localhost:8000/incidents/$incidentId"
-```
-
-The detector processes unassigned logs and returns counts for created incidents, assigned logs, and weak relationships. Existing Phase 1 logs can be detected without being submitted again.
-
-### Correlation precedence and safeguards
-
-1. Exact `trace_id` matches provide the strongest grouping rule.
-2. Exact `request_id` matches are used when trace evidence does not conflict.
-3. Different nonempty trace IDs prevent grouping through a shared request ID.
-4. An incident has a fixed maximum span controlled by `CORRELATION_WINDOW_SECONDS`; chains of nearby events cannot extend it indefinitely.
-5. Identifier-free errors can group only when service, exception type, and normalized message fingerprint match within the window.
-6. Fingerprinting normalizes changing numeric values, UUIDs, and hexadecimal addresses so repeated forms of one error can group.
-7. ERROR and CRITICAL logs seed incidents. Lower-severity records attach only as identifier-matched context.
-8. Repeated fingerprints, multi-service traces, and error bursts add transparent detection signals.
-9. A timeout or latency event in a downstream service may link to an earlier dependency failure as weak evidence. It does not merge the incidents or prove causality.
-10. Conflicting request or trace identifiers block weak dependency links.
-
-The sample dataset groups the database and payment errors sharing `trace-payment-001`. Its unrelated user-service warning remains queryable but does not seed that incident.
-
-Detection is idempotent for stored log IDs. It does not reassign or retroactively merge existing incidents. New failures do not attach to resolved incidents; recurrence creates another incident.
-
-### Incident lifecycle
-
-Statuses are `open`, `investigating`, and `resolved`.
-
-```powershell
-Invoke-RestMethod 'http://localhost:8000/incidents?service=payment-service&status=open&limit=10'
-
-Invoke-RestMethod -Method Patch -Uri "http://localhost:8000/incidents/$incidentId" `
-  -ContentType 'application/json' -Body '{"status":"investigating"}'
-
-Invoke-RestMethod -Method Patch -Uri "http://localhost:8000/incidents/$incidentId" `
-  -ContentType 'application/json' -Body '{"status":"resolved"}'
-```
-
-A status change records workflow state only. It does not confirm a cause or save a verified resolution.
-
-## Phase 3: evidence-backed AI-assisted RCA
-
-Phase 3 builds a bounded evidence package from an existing incident and asks the selected provider for a strict JSON report. The backend then validates that report before saving it.
-
-### RCA pipeline
-
-1. Load the incident, its original logs, membership reasons, detection rules, and eligible weak relationships.
-2. Select ERROR/CRITICAL logs first, followed by lower-severity context, while applying log-count and character limits.
-3. Record evidence omissions and truncation as explicit evidence gaps.
-4. Send the evidence and system instructions to the selected provider.
-5. Decode and validate the response with `RCAOutput`.
-6. Verify every cited log ID belongs to the supplied evidence snapshot and reject duplicate citation IDs.
-7. Reject invented services, overlapping supporting/contradicting citations, invalid ranks, unsupported statuses, and unknown fields.
-8. For a hypothesis, require at least one observed fact, reject duplicate cause text case-insensitively, and require confidence to be non-increasing by rank.
-9. Require `probable_cause` to equal the first ranked cause and require its top-level citation list to match the first cause's citations exactly, including order.
-10. Convert a report with contradictory evidence on its first-ranked cause to inconclusive, clear the selected cause and top-level citations, and lower confidence.
-11. Merge snapshot omission and truncation gaps into the final report, remove duplicates while preserving order, and keep at most 20 gaps.
-12. Persist the analysis, evidence snapshot, hash, provider, model, prompt version, validation notes, and total duration in one report transaction.
-
-Reports can have `hypothesis` or `inconclusive` status. They cannot claim `confirmed`. Every API response retains `causality: "unconfirmed"`.
-
-### Gemini configuration
-
-```dotenv
-RCA_PROVIDER=gemini
-GEMINI_API_KEY=your-local-key
-GEMINI_MODEL=gemini-3.5-flash-lite
-RCA_TIMEOUT_SECONDS=30
-RCA_MAX_LOGS=40
-RCA_MAX_EVIDENCE_CHARS=40000
-RCA_MAX_OUTPUT_TOKENS=4000
-```
-
-The adapter uses Google's official `v1beta/models/{model}:generateContent` endpoint through HTTPX. It sends the key in the `x-goog-api-key` header and uses native `systemInstruction`, `contents`, and `generationConfig` fields. JSON output is requested with `responseMimeType: application/json` and a translated `responseJsonSchema`.
-
-The generated schema retains closed objects, required fields, enums, nullability, minimum array sizes, root array limits, and numeric rank bounds. Controlled live testing found that Google's schema validator rejected the complete RCA schema when three nested citation arrays included `maxItems`. Those three generation-time bounds are omitted, while the unchanged Pydantic model still enforces their 100-ID limits before persistence. Details and probe results are recorded in [docs/gemini-investigation.md](docs/gemini-investigation.md).
-
-Only one candidate ending with `STOP` is accepted. Blocked, incomplete, empty, oversized, malformed, or unexpected responses are rejected. There are no automatic retries, provider fallbacks, model switches, tools, or search calls.
-
-Gemini availability, free-tier eligibility, and limits depend on the Google project. Consult [Gemini pricing](https://ai.google.dev/gemini-api/docs/pricing), [rate limits](https://ai.google.dev/gemini-api/docs/rate-limits), and [structured output documentation](https://ai.google.dev/gemini-api/docs/generate-content/structured-output).
-
-### OpenAI configuration
-
-```dotenv
-RCA_PROVIDER=openai
-OPENAI_API_KEY=your-local-key
-OPENAI_MODEL=your-structured-output-capable-model
-RCA_TIMEOUT_SECONDS=30
-RCA_MAX_LOGS=40
-RCA_MAX_EVIDENCE_CHARS=40000
-RCA_MAX_OUTPUT_TOKENS=4000
-```
-
-The OpenAI adapter uses the Responses API with strict structured output and `store: false`. Only the selected provider requires credentials. Set `RCA_PROVIDER=disabled` to stop new analyses while keeping saved reports readable.
-
-### Generate and retrieve an RCA report
-
-```powershell
-$incidentId = 1
-$report = Invoke-RestMethod -Method Post `
-  -Uri "http://localhost:8000/incidents/$incidentId/analyze" `
-  -ContentType 'application/json' -Body '{"max_logs":40}'
-
-$report.analysis | ConvertTo-Json -Depth 10
-Invoke-RestMethod "http://localhost:8000/incidents/$incidentId/analyses?limit=20&offset=0"
-Invoke-RestMethod "http://localhost:8000/incidents/$incidentId/analyses/$($report.id)"
-```
-
-The request body is optional. `max_logs` must be between 1 and 100 and cannot exceed the server limit. Every successful request creates a new immutable report and makes a provider call when usable evidence exists. Retrieval never calls the provider.
-
-New reports use prompt version `rca-v2`, which explicitly requires the probable cause to be a verbatim copy of the first ranked cause. Existing reports retain the prompt version stored at creation.
-
-### Trust and failure boundaries
-
-- Logs, identifiers, exception text, and incident titles are treated as untrusted data, not instructions.
-- Provider credentials are never put in URLs, response bodies, or application diagnostics.
-- Public failures do not expose provider bodies, authorization headers, incident evidence, or API keys.
-- Gemini diagnostics log only HTTP status, an allowlisted provider status, and a bounded classified description.
-- OpenAI diagnostics use fixed failure categories and omit response bodies and exception details.
-- RCA orchestration records provider-call elapsed time with a monotonic clock for successful and failed calls. Validation and persistence failures use stable categories.
-- Diagnostic records include bounded provider, model, prompt-version, status, and timing fields where applicable. They exclude full prompts, raw evidence, raw provider output, authorization headers, API keys, and unsanitized response bodies.
-- Provider response envelopes and extracted report text have hard size limits.
-- Report metadata is created only after provider output passes validation. A report is returned and logged as persisted only after the database commit succeeds; persistence errors roll back and retain the controlled API error.
-- Failed calls, rejected output, and failed commits do not leave report rows.
-- A cited log proves only that the log was supplied and referenced; human review is still required to judge whether it supports the claim.
-
-Provider requests send selected incident evidence to the configured external service. Review log contents and the provider's data terms before enabling RCA.
-
-## API reference
-
-| Method | Endpoint | Purpose |
-|---|---|---|
-| GET | `/health` | Check API and database readiness |
-| POST | `/logs` | Validate, normalize, and store a log batch |
-| GET | `/logs` | Filter and paginate stored logs |
-| POST | `/incidents/detect` | Run deterministic detection over unassigned logs |
-| GET | `/incidents` | Filter and paginate incidents |
-| GET | `/incidents/{id}` | Retrieve an incident timeline, evidence, and relationships |
-| PATCH | `/incidents/{id}` | Change incident workflow status |
-| POST | `/incidents/{id}/analyze` | Generate, validate, and save an RCA report |
-| GET | `/incidents/{id}/analyses` | Retrieve paginated report history, newest first |
-| GET | `/incidents/{id}/analyses/{report_id}` | Retrieve one report and its evidence snapshot |
-
-Common error behavior:
-
-| Status | Meaning |
-|---:|---|
-| 404 | Requested incident or report does not exist |
-| 422 | Request validation failed |
-| 502 | Provider/configuration error, refused or malformed output, or failed RCA validation |
-| 503 | Database unavailable, RCA disabled, missing provider configuration, or provider quota/rate limit |
-| 504 | Provider request timed out |
-
-## Testing and validation
+## Testing
 
 The suite uses mocked provider transports; automated tests never make live Gemini or OpenAI calls.
 
@@ -665,18 +701,47 @@ Coverage includes validation and normalization, filtering, atomic batches, deter
 The fixture-backed benchmark makes no live Gemini or OpenAI requests. It verifies deterministic
 contract and persistence behavior; it does not measure causal accuracy, throughput, or latency.
 
-## Persistence verification
+## Project Structure
 
-```powershell
-$before = Invoke-RestMethod http://localhost:8000/incidents
-docker compose restart api
-Invoke-RestMethod http://localhost:8000/health
-$after = Invoke-RestMethod http://localhost:8000/incidents
+```text
+app/
+  config.py          Environment-backed settings
+  correlation.py     Detection and correlation rules
+  database.py        SQLAlchemy engine, session, and metadata
+  incidents.py       Incident API routes
+  llm.py             Gemini and OpenAI provider adapters
+  main.py            FastAPI application, startup checks, health, and log routes
+  migrations.py      Explicit migration command and revision verification
+  models.py          Persistent database models
+  rca.py             Evidence construction, validation, and report persistence
+  rca_routes.py      RCA API routes
+  rca_schemas.py     Strict RCA contracts
+  schemas.py         Log and incident contracts
+migrations/
+  env.py             Alembic runtime configuration
+  versions/          Ordered database revisions
+data/
+  sample_logs.json   Synthetic database/payment failure scenario
+docs/
+  gemini-investigation.md  Live Gemini request-contract investigation
+tests/
+  conftest.py
+  test_incidents.py
+  test_llm.py
+  test_logs.py
+  test_migrations.py
+  test_rca.py
+  test_startup.py
+alembic.ini          Alembic configuration
+compose.yaml         Local API and PostgreSQL services
+Dockerfile           Reproducible non-root API image
+pyproject.toml       Project metadata and direct dependencies
+uv.lock              Cross-platform resolved dependency lock
 ```
 
-Incident IDs, statuses, logs, and saved RCA reports should remain available. Running detection again without new logs should produce zero new assignments.
+## Future Scope
 
-## Current limitations
+### Current limitations
 
 - Detection scans stored logs and memberships in memory and is intended for a development-scale dataset.
 - RCA requests are synchronous.
@@ -695,45 +760,12 @@ Incident IDs, statuses, logs, and saved RCA reports should remain available. Run
 
 PostgreSQL advisory transaction locking serializes detector runs so concurrent workers cannot assign the same stored log twice.
 
-## Repository layout
+Potential future work includes semantic search over prior incidents, a reviewed resolution knowledge
+base, asynchronous RCA jobs, authentication and tenant isolation, operational dashboards, scalable
+detection for larger datasets, and separately approved live-provider quality evaluation. Automated
+remediation should be considered only with explicit review and operational safeguards.
 
-```text
-app/
-  config.py          Environment-backed settings
-  correlation.py     Detection and correlation rules
-  database.py        SQLAlchemy engine, session, and metadata
-  incidents.py       Incident API routes
-  llm.py             Gemini and OpenAI provider adapters
-  main.py            FastAPI application, health, and log routes
-  models.py          Persistent database models
-  rca.py             Evidence construction, validation, and report persistence
-  rca_routes.py      RCA API routes
-  rca_schemas.py     Strict RCA contracts
-  schemas.py         Log and incident contracts
-data/
-  sample_logs.json   Synthetic database/payment failure scenario
-docs/
-  gemini-investigation.md  Live Gemini request-contract investigation
-tests/
-  conftest.py
-  test_logs.py
-  test_incidents.py
-  test_llm.py
-  test_rca.py
-compose.yaml
-Dockerfile
-pyproject.toml
-```
+## License
 
-## Phase 4
-
-Phase 4's deterministic RCA validation and reliability audit is complete. The implemented boundary
-includes ordered citation consistency, observed-fact requirements for hypotheses, duplicate-cause
-rejection, non-increasing confidence by rank, contradictory-evidence handling, normalized evidence
-gaps, persistence rollback coverage, immutable report metadata, sanitized structured diagnostics,
-provider no-retry tests, and the fixture-backed `rca_benchmark` suite.
-
-This phase establishes repeatable contract validation and failure handling. It does not establish
-that a provider's proposed cause is correct, compare model quality, benchmark request throughput or
-latency, exercise live provider services, add reviewed causes or resolutions, or make RCA processing
-asynchronous. Those remain separate product and evaluation concerns.
+This repository does not currently include a license file. Unless the repository owner adds an
+explicit license, no permission to use, copy, modify, or distribute the project is granted.
